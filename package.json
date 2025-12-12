@@ -1,0 +1,19 @@
+{
+  "name": "ecommerce-voicebot",
+  "version": "1.0.0",
+  "description": "python -m venv .venv source .venv/bin/activate pip install -r requirements.txt",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "livekit-client": "^2.16.0",
+    "livekit-server-sdk": "^2.15.0"
+  }
+}

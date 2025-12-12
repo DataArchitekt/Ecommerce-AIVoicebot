@@ -1,0 +1,15 @@
+fastapi==0.95.2
+uvicorn[standard]==0.21.1
+python-multipart
+requests
+sqlalchemy==1.4.54
+databases==0.6.1
+psycopg2-binary==2.9.9
+python-dotenv==1.0.1
+openai-whisper # if using openai/whisper repo via pip; see notes below
+torch     # required by whisper (or you can use openai/whisperx or faster alternatives)
+pydub
+PyJWT
+ffmpeg
+gTTS
+aiofiles

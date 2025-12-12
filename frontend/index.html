@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Mic → STT (Local)</title>
+  <style>
+    body { font-family: monospace; padding: 20px; }
+    #logs { height: 360px; border: 1px solid #ddd; padding: 8px; overflow:auto; white-space: pre-wrap; }
+    button { margin-right: 8px; }
+  </style>
+</head>
+<body>
+  <h2>Mic → STT (Local)</h2>
+  <button id="start">Start Capture & Stream</button>
+  <button id="stop" disabled>Stop (send EOS)</button>
+  <button id="uploadTest">Upload test WAV to /stt/file</button>
+  <input id="fileinp" type="file" accept=".wav" style="display:none">
+  <div id="logs"></div>
+
+<script>
+const logEl = document.getElementById('logs');
+const L = (s)=> { logEl.innerText = new Date().toISOString() + " — " + s + "\n\n" + logEl.innerText; console.log(s); };
+
+let mediaRecorder = null;
+let ws = null;
+
+// replace previous mediaRecorder code with chunk-buffering + single upload on stop
+let chunks = [];
+
+document.getElementById('start').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    L('Got mic stream');
+    // open WS optionally for control/ACK; but we will upload final Blob to /stt/file
+    ws = new WebSocket('ws://127.0.0.1:8000/stt/ws'); // optional, can be removed
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => L('WebSocket opened (optional)');
+    ws.onmessage = (ev) => L('WS msg: ' + ev.data);
+
+    chunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) {
+        chunks.push(ev.data);
+      }
+    };
+    mediaRecorder.onstart = () => L('MediaRecorder started');
+    mediaRecorder.start(1000); // buffer chunks every 1s
+    document.getElementById('start').disabled = true;
+    document.getElementById('stop').disabled = false;
+  } catch (e) {
+    L('Error getting mic: ' + e);
+  }
+};
+
+document.getElementById('stop').onclick = async () => {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  // assemble blob
+  const blob = new Blob(chunks, { type: chunks[0]?.type || 'audio/webm' });
+  L('Final blob size: ' + blob.size);
+  // send to /stt/file using fetch form upload (reuses stable server path)
+  const fd = new FormData();
+  const filename = 'mic_recording.webm';
+  fd.append('file', blob, filename);
+  L('Uploading combined blob to /stt/file ...');
+  try {
+    const resp = await fetch('http://127.0.0.1:8000/stt/file', { method: 'POST', body: fd });
+    const j = await resp.json();
+    L('TRANSCRIPT (file upload): ' + JSON.stringify(j));
+  } catch (e) {
+    L('Upload error: ' + e);
+  }
+  // optional: close ws or send EOS if you want to keep ws flow
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send("EOS");
+    ws.close();
+  }
+  document.getElementById('start').disabled = false;
+  document.getElementById('stop').disabled = true;
+};
+
+document.getElementById('uploadTest').onclick = () => document.getElementById('fileinp').click();
+document.getElementById('fileinp').onchange = async (ev) => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  L('Uploading ' + f.name + ' to /stt/file ...');
+  const fd = new FormData();
+  fd.append('file', f);
+  try {
+    const resp = await fetch('http://127.0.0.1:8000/stt/file', { method: 'POST', body: fd });
+    const j = await resp.json();
+    L('Response: ' + JSON.stringify(j));
+  } catch (e) {
+    L('Upload error: ' + e);
+  }
+};
+</script>
+</body>
+</html>

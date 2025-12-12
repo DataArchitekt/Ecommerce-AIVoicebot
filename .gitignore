@@ -1,0 +1,12 @@
+# Virtualenvs
+.venv/
+venv/
+backend/.venv/
+# Environment files
+.env
+# Debug / artifacts
+stt_dbg/
+*.wav
+*.webm
+*.pyc
+.DS_Store
