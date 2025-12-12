@@ -1,4 +1,4 @@
-fastapi==0.95.2
+fastapi==0.100.0
 uvicorn[standard]==0.21.1
 python-multipart
 requests
@@ -13,3 +13,16 @@ PyJWT
 ffmpeg
 gTTS
 aiofiles
+openai>=0.27.0
+#faiss-cpu>=1.7.4
+chromadb>=0.4.3
+sentence-transformers>=2.2.2
+transformers>=4.30.0
+weaviate-client>=4.18.3  # optional, you can ignore if you never use weaviate
+httpx>=0.24.0
+pytest>=7.3.0
+langchain>=0.3.27
+langchain-openai>=0.1.0
+langchain-community>=0.2.0
+pydantic>=2.8.0
+sqlalchemy>=1.4

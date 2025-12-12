@@ -1,139 +1,271 @@
 # backend/app/main.py
-"""
-Minimal Day-1 backend:
-- /livekit/token (uses token_utils if present; harmless stub otherwise)
-- /stt/file  (file upload -> transcribe_file)
-- /stt/ws    (websocket: receive binary chunks, send "EOS" to finalize -> transcript)
-- /_env      (debug env presence)
-- /health    (healthcheck)
-"""
-
-from pathlib import Path
-from dotenv import load_dotenv
 import os
-import tempfile
-import shutil
+import re
 import time
-import logging
+import json
+import traceback
+from pathlib import Path
+from typing import Optional, List, Dict, Any
 
-from typing import Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Query, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+# Load backend/.env if present
+ROOT = Path(__file__).resolve().parents[1]
+ENV = ROOT / ".env"
+if ENV.exists():
+    from dotenv import load_dotenv
+    load_dotenv(ENV)
 
-# try to load dotenv from project root (../..)
-ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
-if ROOT_ENV.exists():
-    load_dotenv(ROOT_ENV)
-else:
-    print("WARNING: .env not found at", ROOT_ENV)
-
-# try import token utils (may not exist); try import stt_adapter (should exist)
+# Try to import project modules using both import styles
 try:
-    from app.token_utils import make_livekit_token
-except Exception as e:
-    make_livekit_token = None
-    print("token_utils import failed (ok for local dev):", e)
+    # prefer explicit backend package import when running from repo root
+    from backend.app.db import init_db, get_history, save_history, get_product_by_id
+    from backend.app.mcp_server import get_order_status as mcp_get_order_status
+    from backend.app.rag import get_retriever
+except Exception:
+    # fallback when running with backend on PYTHONPATH as top-level package "app"
+    try:
+        from app.db import init_db, get_history, save_history, get_product_by_id
+        from app.mcp_server import get_order_status as mcp_get_order_status
+        from app.rag import get_retriever
+    except Exception:
+        # graceful placeholders if imports fail (keeps server up for other endpoints)
+        init_db = lambda: None
+        get_history = lambda session_id: []
+        save_history = lambda session_id, history: None
+        get_product_by_id = lambda pid: None
+        mcp_get_order_status = lambda order_id: {"order_id": order_id, "status": "UNKNOWN", "eta": None}
+        get_retriever = None
 
+# Chain builder import (LangChain wiring)
 try:
-    from app.stt_adapter import transcribe_file
-except Exception as e:
-    print("stt_adapter import failed; using fallback stub:", e)
-    def transcribe_file(path: str) -> str:
-        return "TRANSCRIPT_PLACEHOLDER"
+    from agents.langchain_prompts import build_chain
+except Exception:
+    try:
+        from backend.agents.langchain_prompts import build_chain
+    except Exception:
+        build_chain = None
 
-app = FastAPI(title="Ecommerce Voicebot - Day1 Backend")
+app = FastAPI(title="Ecommerce Voicebot Day-2 (Hybrid LLM)")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Globals to hold retriever & chain
+retriever = None
+chain = None
 
-@app.get("/_env")
-def _env():
-    return {
-        "LIVEKIT_API_KEY": bool(os.environ.get("LIVEKIT_API_KEY")),
-        "LIVEKIT_API_SECRET": bool(os.environ.get("LIVEKIT_API_SECRET")),
-        "STT_MODEL": os.environ.get("STT_MODEL"),
-    }
+@app.on_event("startup")
+def startup_event():
+    global retriever, chain
+    # initialize DB (if configured)
+    try:
+        init_db()
+    except Exception as e:
+        print("DB init failed:", e)
+
+    # Try to eagerly initialize retriever + chain; if it fails we lazily build later
+    try:
+        if get_retriever:
+            retriever = get_retriever()
+        if retriever and build_chain:
+            chain = build_chain(retriever)
+            print("RAG chain initialized on startup.")
+        else:
+            print("RAG chain not initialized on startup (missing retriever or build_chain).")
+    except Exception:
+        print("Warning: chain init failed on startup.")
+        traceback.print_exc()
+        retriever = None
+        chain = None
 
 @app.get("/health")
 def health():
     return {"status": "ok", "time": int(time.time())}
 
-# Token endpoint (uses token_utils if present - harmless local stub if not)
-@app.get("/livekit/token")
-def get_livekit_token(room: str = Query("test-room"), identity: Optional[str] = Query(None)):
-    if make_livekit_token is None:
-        # return a harmless stub token for local dev
-        return PlainTextResponse("LOCAL-STUB-TOKEN")
-    token = make_livekit_token(room=room, identity=identity)
-    return PlainTextResponse(str(token).strip())
+class AgentRequest(BaseModel):
+    transcript: str
+    session_id: str
 
-# STT file upload endpoint
-@app.post("/stt/file")
-async def stt_file(file: UploadFile = File(...)):
-    temp_dir = tempfile.mkdtemp(prefix="stt_")
+def parse_action_from_text(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    m = re.search(r"\[\[ACTION\]\](\{.*?\})\[\[/ACTION\]\]", text, re.S)
+    if not m:
+        return None
     try:
-        path = os.path.join(temp_dir, file.filename)
-        with open(path, "wb") as f:
-            f.write(await file.read())
-        transcript = transcribe_file(path)
-        return {"transcript": transcript}
-    finally:
+        return json.loads(m.group(1))
+    except Exception:
+        return None
+
+# Structured intent detection helpers
+def detect_order_id(text: str) -> Optional[str]:
+    m = re.search(r"\border\s*(?:id\s*)?[:#]?\s*(\d+)\b", text, re.I)
+    if m:
+        return m.group(1)
+    return None
+
+def detect_product_id(text: str) -> Optional[int]:
+    m = re.search(r"\bproduct\s+(?:id\s*)?[:#]?\s*(\d+)\b", text, re.I)
+    if m:
         try:
-            shutil.rmtree(temp_dir)
+            return int(m.group(1))
         except Exception:
-            pass
+            return None
+    return None
 
-# WebSocket streaming STT
-@app.websocket("/stt/ws")
-async def stt_ws(websocket: WebSocket):
+@app.post("/agent/handle")
+async def agent_handle(req: AgentRequest):
     """
-    Receives binary audio chunks (from MediaRecorder as arrayBuffer). When client sends text "EOS",
-    server runs transcribe_file on the accumulated file and replies with {"transcript": "..."}.
+    Accepts: { transcript: str, session_id: str }
+    Returns: { reply: str, sources: [{page_content, metadata}], actions: [{name,args,...}] }
     """
-    await websocket.accept()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".webm")
-    tmp_path = tmp.name
-    tmp.close()
-    logging.info("STT WS: writing to %s", tmp_path)
+    global retriever, chain
+
+    if not req.transcript:
+        raise HTTPException(status_code=400, detail="transcript required")
+
+    # Load/save conversation history convenience
     try:
-        while True:
-            msg = await websocket.receive()
-            # binary frames -> key "bytes"
-            if "bytes" in msg:
-                with open(tmp_path, "ab") as f:
-                    f.write(msg["bytes"])
-            elif "text" in msg:
-                text = msg["text"]
-                if text == "EOS":
-                    try:
-                        transcript = transcribe_file(tmp_path)
-                        await websocket.send_json({"transcript": transcript})
-                    except Exception as e:
-                        await websocket.send_json({"error": str(e)})
-                    finally:
-                        await websocket.close()
-                        break
-                else:
-                    await websocket.send_text("ACK:" + text)
-            elif msg.get("type") == "websocket.disconnect":
-                raise WebSocketDisconnect()
-    except WebSocketDisconnect:
-        logging.info("WS client disconnected; attempting finalize if data available")
+        history = get_history(req.session_id) or []
+    except Exception:
+        history = []
+
+    # 1) Structured intent: ORDER (exact)
+    order_id = detect_order_id(req.transcript)
+    if order_id:
+        # Call MCP stub (immediate deterministic path)
         try:
-            if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-                t = transcribe_file(tmp_path)
-                logging.info("Partial transcript on disconnect: %s", t)
+            mcp_result = mcp_get_order_status(order_id)
         except Exception as e:
-            logging.exception("Error finalizing transcript on disconnect: %s", e)
-    finally:
+            mcp_result = {"error": str(e)}
+        reply = f"Order {order_id} status: {mcp_result.get('status', 'UNKNOWN')}. ETA: {mcp_result.get('eta')}"
+        # persist history
         try:
-            os.remove(tmp_path)
+            history.append({"role":"user","text":req.transcript})
+            history.append({"role":"assistant","text":reply})
+            save_history(req.session_id, history)
         except Exception:
             pass
+        return {
+            "reply": reply,
+            "sources": [],
+            "actions": [{"name":"get_order_status","args":{"order_id":order_id},"result":mcp_result}]
+        }
+
+    # 2) Structured intent: PRODUCT ID (exact)
+    prod_id = detect_product_id(req.transcript)
+    if prod_id is not None:
+        try:
+            prod = get_product_by_id(prod_id)
+        except Exception:
+            prod = None
+        if prod:
+            reply = f"{prod.get('name')} (SKU: {prod.get('sku')}): {prod.get('description')}. Price: {prod.get('price')} {prod.get('currency')}."
+            try:
+                history.append({"role":"user","text":req.transcript})
+                history.append({"role":"assistant","text":reply})
+                save_history(req.session_id, history)
+            except Exception:
+                pass
+            return {
+                "reply": reply,
+                "sources": [{"page_content": str(prod), "metadata": {"table":"products","id":prod_id}}],
+                "actions": []
+            }
+        # If product not found, continue to RAG fallback
+
+    # 3) Ensure chain exists (lazy init)
+    if chain is None:
+        try:
+            if get_retriever and build_chain:
+                retriever = get_retriever()
+                chain = build_chain(retriever)
+                print("DEBUG: chain lazily initialized inside agent_handle.")
+            else:
+                print("DEBUG: get_retriever or build_chain unavailable.")
+        except Exception as e:
+            # print traceback in server logs and return a useful reply
+            traceback.print_exc()
+            reply = f"LLM init failed: {type(e).__name__}: {str(e)[:200]}"
+            # save minimal history
+            try:
+                history.append({"role":"user","text":req.transcript})
+                history.append({"role":"assistant","text":reply})
+                save_history(req.session_id, history)
+            except Exception:
+                pass
+            return {"reply": reply, "sources": [], "actions": []}
+
+    # 4) If chain still missing, respond gracefully
+    if chain is None:
+        reply = "Agent not available (LLM not initialized)."
+        try:
+            history.append({"role":"user","text":req.transcript})
+            history.append({"role":"assistant","text":reply})
+            save_history(req.session_id, history)
+        except Exception:
+            pass
+        return {"reply": reply, "sources": [], "actions": []}
+
+    # 5) Prepare chat history for ConversationalRetrievalChain API (list of (user, assistant))
+    formatted_history = []
+    user_buf = None
+    for item in history:
+        r = item.get("role"); t = item.get("text")
+        if r == "user":
+            user_buf = t
+        elif r == "assistant" and user_buf:
+            formatted_history.append((user_buf, t))
+            user_buf = None
+
+    # 6) Run the chain
+    try:
+        result = chain({"question": req.transcript, "chat_history": formatted_history})
+    except Exception as e:
+        # fallback to older chain.run() shape if necessary
+        try:
+            result_text = chain.run(req.transcript)
+            result = {"answer": result_text, "source_documents": []}
+        except Exception as e2:
+            traceback.print_exc()
+            reply = f"LLM error: {type(e2).__name__}: {str(e2)[:200]}"
+            try:
+                history.append({"role":"user","text":req.transcript})
+                history.append({"role":"assistant","text":reply})
+                save_history(req.session_id, history)
+            except Exception:
+                pass
+            return {"reply": reply, "sources": [], "actions": []}
+
+    # 7) Normalize chain result
+    reply_text = result.get("answer") or result.get("response") or result.get("output_text") or ""
+    source_docs = []
+    for d in result.get("source_documents", []):
+        try:
+            source_docs.append({"page_content": d.page_content, "metadata": getattr(d, "metadata", {})})
+        except Exception:
+            try:
+                source_docs.append(dict(d))
+            except Exception:
+                source_docs.append({"page_content": str(d)})
+
+    # 8) Parse actions embedded in LLM reply (if any) and call MCP
+    action = parse_action_from_text(reply_text)
+    actions = []
+    if action:
+        actions.append(action)
+        if action.get("name") == "get_order_status":
+            order_id_arg = action.get("args", {}).get("order_id")
+            try:
+                actions[0]["result"] = mcp_get_order_status(order_id_arg)
+            except Exception as e:
+                actions[0]["error"] = str(e)
+
+    # 9) Save updated history
+    try:
+        history.append({"role":"user","text":req.transcript})
+        history.append({"role":"assistant","text":reply_text})
+        save_history(req.session_id, history)
+    except Exception:
+        pass
+
+    return {"reply": reply_text, "sources": source_docs, "actions": actions}

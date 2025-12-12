@@ -1,12 +1,25 @@
-# Virtualenvs
+# Virtual envs
 .venv/
-venv/
+.venv_p2/
 backend/.venv/
-# Environment files
-.env
-# Debug / artifacts
-stt_dbg/
-*.wav
-*.webm
+
+# Python cache
+__pycache__/
 *.pyc
+
+# IDE files
+.vscode/
+.idea/
+
+# Environment / secrets
+backend/.env
+.env
+*.env
+
+# Model/vector indices
+vector_db/
+faiss_index/
+data/
+
+# OS junk
 .DS_Store
