@@ -2,97 +2,170 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mic → STT (Local)</title>
+  <title>Mic → STT → Agent → TTS</title>
   <style>
     body { font-family: monospace; padding: 20px; }
-    #logs { height: 360px; border: 1px solid #ddd; padding: 8px; overflow:auto; white-space: pre-wrap; }
+    #logs {
+      height: 360px;
+      border: 1px solid #ddd;
+      padding: 8px;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
     button { margin-right: 8px; }
   </style>
 </head>
+
 <body>
-  <h2>Mic → STT (Local)</h2>
-  <button id="start">Start Capture & Stream</button>
-  <button id="stop" disabled>Stop (send EOS)</button>
-  <button id="uploadTest">Upload test WAV to /stt/file</button>
-  <input id="fileinp" type="file" accept=".wav" style="display:none">
+  <h2>Mic → STT → Agent → TTS (WebSocket)</h2>
+
+  <button id="start">Start Capture</button>
+  <button id="stop" disabled>Stop & Send</button>
+
   <div id="logs"></div>
 
 <script>
-const logEl = document.getElementById('logs');
-const L = (s)=> { logEl.innerText = new Date().toISOString() + " — " + s + "\n\n" + logEl.innerText; console.log(s); };
+/* -----------------------------
+    Logging helper
+------------------------------ */
+const logEl = document.getElementById("logs");
+const L = (s) => {
+  logEl.innerText =
+    new Date().toISOString() + " — " + s + "\n\n" + logEl.innerText;
+  console.log(s);
+};
 
+/* -----------------------------
+    AudioContext (CRITICAL)
+------------------------------ */
+let audioCtx = null;
+
+function ensureAudioContext() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    console.log("AudioContext created");
+  }
+
+  console.log("AudioContext state BEFORE:", audioCtx.state);
+
+  if (audioCtx.state === "suspended") {
+    audioCtx.resume().then(() => {
+      console.log("AudioContext resumed");
+    });
+  }
+
+  console.log("AudioContext state AFTER:", audioCtx.state);
+}
+
+/* -----------------------------
+   TTS playback via Web Audio API
+------------------------------ */
+let ttsChunks = [];
+let ttsWs = null;
+
+async function playTTS() {
+  if (!audioCtx || ttsChunks.length === 0) return;
+
+  const blob = new Blob(ttsChunks, { type: "audio/wav" });
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+  const source = audioCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioCtx.destination);
+  source.start(0);
+
+  ttsChunks = [];
+}
+
+/* -----------------------------
+    Mic capture
+------------------------------ */
 let mediaRecorder = null;
-let ws = null;
-
-// replace previous mediaRecorder code with chunk-buffering + single upload on stop
 let chunks = [];
 
-document.getElementById('start').onclick = async () => {
+document.getElementById("start").onclick = async () => {
   try {
+    ensureAudioContext(); // 👈 unlocks browser audio
+
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    L('Got mic stream');
-    // open WS optionally for control/ACK; but we will upload final Blob to /stt/file
-    ws = new WebSocket('ws://127.0.0.1:8000/stt/ws'); // optional, can be removed
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => L('WebSocket opened (optional)');
-    ws.onmessage = (ev) => L('WS msg: ' + ev.data);
+    L("Got mic stream");
 
     chunks = [];
     mediaRecorder = new MediaRecorder(stream);
+
     mediaRecorder.ondataavailable = (ev) => {
       if (ev.data && ev.data.size > 0) {
         chunks.push(ev.data);
       }
     };
-    mediaRecorder.onstart = () => L('MediaRecorder started');
-    mediaRecorder.start(1000); // buffer chunks every 1s
-    document.getElementById('start').disabled = true;
-    document.getElementById('stop').disabled = false;
+
+    mediaRecorder.onstart = () => L("MediaRecorder started");
+    mediaRecorder.start(1000);
+
+    document.getElementById("start").disabled = true;
+    document.getElementById("stop").disabled = false;
   } catch (e) {
-    L('Error getting mic: ' + e);
+    L("Error getting mic: " + e);
   }
 };
 
-document.getElementById('stop').onclick = async () => {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-  // assemble blob
-  const blob = new Blob(chunks, { type: chunks[0]?.type || 'audio/webm' });
-  L('Final blob size: ' + blob.size);
-  // send to /stt/file using fetch form upload (reuses stable server path)
-  const fd = new FormData();
-  const filename = 'mic_recording.webm';
-  fd.append('file', blob, filename);
-  L('Uploading combined blob to /stt/file ...');
-  try {
-    const resp = await fetch('http://127.0.0.1:8000/stt/file', { method: 'POST', body: fd });
-    const j = await resp.json();
-    L('TRANSCRIPT (file upload): ' + JSON.stringify(j));
-  } catch (e) {
-    L('Upload error: ' + e);
+/* -----------------------------
+    Stop → upload → agent → TTS
+------------------------------ */
+document.getElementById("stop").onclick = async () => {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
   }
-  // optional: close ws or send EOS if you want to keep ws flow
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send("EOS");
-    ws.close();
-  }
-  document.getElementById('start').disabled = false;
-  document.getElementById('stop').disabled = true;
-};
 
-document.getElementById('uploadTest').onclick = () => document.getElementById('fileinp').click();
-document.getElementById('fileinp').onchange = async (ev) => {
-  const f = ev.target.files[0];
-  if (!f) return;
-  L('Uploading ' + f.name + ' to /stt/file ...');
+  const blob = new Blob(chunks, { type: chunks[0]?.type || "audio/webm" });
+  L("Final blob size: " + blob.size);
+
   const fd = new FormData();
-  fd.append('file', f);
+  fd.append("file", blob, "mic_recording.webm");
+
+  L("Uploading combined blob to /stt/file ...");
+
   try {
-    const resp = await fetch('http://127.0.0.1:8000/stt/file', { method: 'POST', body: fd });
+    const resp = await fetch("http://localhost:8000/stt/file", {
+      method: "POST",
+      body: fd,
+    });
+
     const j = await resp.json();
-    L('Response: ' + JSON.stringify(j));
+    L("TRANSCRIPT: " + JSON.stringify(j));
+
+    /* ---- Agent WebSocket ---- */
+    ttsWs = new WebSocket("ws://localhost:8000/ws/agent");
+    ttsWs.binaryType = "arraybuffer";
+    ttsChunks = [];
+
+    ttsWs.onopen = () => {
+      L("Agent WS opened");
+      ttsWs.send(JSON.stringify({
+        transcript: j.text || j.transcript || "",
+        session_id: "demo-session"
+      }));
+    };
+
+    ttsWs.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        console.log("Audio chunk:", event.data.byteLength);
+        ttsChunks.push(event.data);
+      } else {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "audio_end") {
+          playTTS();
+        }
+      }
+    };
+
   } catch (e) {
-    L('Upload error: ' + e);
+    L("Upload error: " + e);
   }
+
+  document.getElementById("start").disabled = false;
+  document.getElementById("stop").disabled = true;
 };
 </script>
 </body>

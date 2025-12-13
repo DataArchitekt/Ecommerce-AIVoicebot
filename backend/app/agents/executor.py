@@ -57,7 +57,14 @@ def execute_task(db: Optional[Session], task: Dict[str, Any], session_id: str, r
         else:
             duration_ms = int((time() - start) * 1000)
             record_mcp_call(db, session_id, name, "unknown", args, {"error": "unknown task"}, "error", duration_ms, run_id=run_id)
-            return {"task": name, "result": {"error": "unknown task"}}
+            return {
+                "task": name,
+                "result": {
+                "error": "unknown task",
+                "needs_human": True
+    }
+}
+
     except Exception as e:
         duration_ms = int((time() - start) * 1000)
         try:

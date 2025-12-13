@@ -84,29 +84,22 @@ def get_product_by_id(product_id: int):
                 cols = result.keys()
                 return {cols[i]: row[i] for i in range(len(cols))}
 
-def record_mcp_call(
-    db,
-    session_id,
-    task_name,
-    tool_name,
-    args,
-    result,
-    status,
-    duration_ms,
-    run_id=None,          
-):
-    entry = McpCall(
-        session_id=session_id,
-        task_name=task_name,
-        tool_name=tool_name,
-        args=args or {},
-        result=result or {},
-        status=status,
-        duration_ms=duration_ms,
-        run_id=run_id,
-    )
+def record_mcp_call(db, session_id, name, tool, args, result, status, duration_ms, run_id=None):
+    # ✅ Allow db to be optional (WS / demo mode)
+    if db is None:
+        return
 
     try:
+        entry = MCPCall(
+            session_id=session_id,
+            name=name,
+            tool=tool,
+            args=args,
+            result=result,
+            status=status,
+            duration_ms=duration_ms,
+            run_id=run_id
+        )
         db.add(entry)
         db.commit()
     except Exception:

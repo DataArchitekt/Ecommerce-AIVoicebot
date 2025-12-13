@@ -4,12 +4,20 @@ import uuid
 import time
 import traceback
 from pathlib import Path
-from typing import Optional, Dict, Any, List
-
+from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
+from fastapi import WebSocket
+from app.tts_adapter import TTSAdapter
+from app.ws_audio_out import stream_wav_over_ws
+from app.stt_file import router as stt_router
+
+from fastapi.middleware.cors import CORSMiddleware
+
+
 
 # ─────────────────────────────────────────────────────────────
 # ENV LOADING (must happen before tracer creation)
@@ -27,7 +35,20 @@ os.environ.setdefault("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 # FastAPI app
 # ─────────────────────────────────────────────────────────────
 app = FastAPI(title="Ecommerce Voicebot (Traced)")
+app.include_router(stt_router)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # ─────────────────────────────────────────────────────────────
 # Imports from project
 # ─────────────────────────────────────────────────────────────
@@ -52,6 +73,97 @@ from backend.app.agents.langchain_prompts import build_chain
 from backend.app.rag import get_retriever
 
 from langchain_core.runnables import RunnableLambda
+
+ESCALATION_VOICE_PROMPT = (
+    "I am connecting you to a human agent now. "
+    "Please stay on the line."
+)
+
+def extract_reply_text(agent_response: dict) -> str:
+    """
+    Converts structured agent output into speakable text for TTS
+    """
+    if not agent_response:
+        return "Sorry, I could not process that."
+
+    result = agent_response.get("result", {})
+
+    if isinstance(result, str):
+        return result
+
+    if isinstance(result, dict):
+        if "reply" in result:
+            return result["reply"]
+        if "message" in result:
+            return result["message"]
+        if "error" in result:
+            return f"Sorry, {result['error']}."
+
+    return "I have processed your request."
+
+
+tts = TTSAdapter()
+
+@app.websocket("/ws/agent")
+async def agent_ws(ws: WebSocket):
+    await ws.accept()
+
+    while True:
+        try:
+            # 1️⃣ Receive payload from frontend
+            data = await ws.receive_json()
+            transcript = data["transcript"]
+            session_id = data["session_id"]
+
+            # 2️⃣ Build task payload for executor
+            task_payload = {
+                "task": "agent",
+                "args": {
+                    "transcript": transcript
+                }
+            }
+
+            # 3️⃣ Call executor with CORRECT signature
+            agent_response = execute_task(
+                db=None,                 # pass DB session if you have one
+                task=task_payload,
+                session_id=session_id
+            )
+
+            # 🔍 DEBUG LOGS
+            print("AGENT RESPONSE:", agent_response)
+
+            # 4️⃣ Extract speakable text
+            reply_text = extract_reply_text(agent_response)
+            print("TTS TEXT:", reply_text)
+
+            # 5️⃣ Generate TTS
+            wav_path = tts.synthesize(reply_text)
+            print("TTS WAV PATH:", wav_path)
+
+            # 6️⃣ Stream bot reply audio
+            await stream_wav_over_ws(ws, wav_path)
+
+            # 7️⃣ Escalation flow (ONLY if triggered)
+            if agent_response.get("result", {}).get("needs_human"):
+                escalation_wav = tts.synthesize(ESCALATION_VOICE_PROMPT)
+                print("ESCALATION WAV:", escalation_wav)
+
+                await stream_wav_over_ws(ws, escalation_wav)
+
+                await ws.send_json({
+                    "type": "escalation",
+                    "message": "Human agent requested"
+                })
+
+        except Exception as e:
+            print("WS AGENT ERROR:", e)
+            await ws.send_json({
+                "type": "error",
+                "message": str(e)
+            })
+            break
+
 
 # ─────────────────────────────────────────────────────────────
 # Global chain (lazy init)
@@ -133,6 +245,23 @@ def agent_handle(req: AgentRequest):
             tracer.record(name, payload)
         except Exception:
             pass
+        
+    def extract_reply_text(agent_response: dict) -> str:
+    #Converts structured agent output into a speakable string for TTS
+        if not agent_response:
+            return "Sorry, I could not process that."
+            result = agent_response.get("result", {})
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            if "reply" in result:
+                return result["reply"]
+        if "message" in result:
+            return result["message"]
+        if "error" in result:
+            return f"Sorry, {result['error']}."
+    return "I have processed your request."
+
 
     # Load conversation history
     history = get_history(req.session_id) or []

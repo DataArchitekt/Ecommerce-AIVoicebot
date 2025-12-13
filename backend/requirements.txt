@@ -31,3 +31,5 @@ alembic
 langsmith        # if you're using LangSmith SDK
 autogen          # (if you use the AutoGen package) OR the autogen package of choice
 respx
+pyttsx3
+elevenlabs
