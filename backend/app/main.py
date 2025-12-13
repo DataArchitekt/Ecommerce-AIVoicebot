@@ -1,271 +1,231 @@
 # backend/app/main.py
 import os
-import re
+import uuid
 import time
-import json
 import traceback
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
-# Load backend/.env if present
+# ─────────────────────────────────────────────────────────────
+# ENV LOADING (must happen before tracer creation)
+# ─────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[1]
-ENV = ROOT / ".env"
-if ENV.exists():
-    from dotenv import load_dotenv
-    load_dotenv(ENV)
+ENV_PATH = ROOT / ".env"
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
 
-# Try to import project modules using both import styles
-try:
-    # prefer explicit backend package import when running from repo root
-    from backend.app.db import init_db, get_history, save_history, get_product_by_id
-    from backend.app.mcp_server import get_order_status as mcp_get_order_status
-    from backend.app.rag import get_retriever
-except Exception:
-    # fallback when running with backend on PYTHONPATH as top-level package "app"
-    try:
-        from app.db import init_db, get_history, save_history, get_product_by_id
-        from app.mcp_server import get_order_status as mcp_get_order_status
-        from app.rag import get_retriever
-    except Exception:
-        # graceful placeholders if imports fail (keeps server up for other endpoints)
-        init_db = lambda: None
-        get_history = lambda session_id: []
-        save_history = lambda session_id, history: None
-        get_product_by_id = lambda pid: None
-        mcp_get_order_status = lambda order_id: {"order_id": order_id, "status": "UNKNOWN", "eta": None}
-        get_retriever = None
+# Enforce LangSmith defaults (Change 1 prerequisite)
+os.environ.setdefault("LANGSMITH_TRACING", "true")
+os.environ.setdefault("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 
-# Chain builder import (LangChain wiring)
-try:
-    from agents.langchain_prompts import build_chain
-except Exception:
-    try:
-        from backend.agents.langchain_prompts import build_chain
-    except Exception:
-        build_chain = None
+# ─────────────────────────────────────────────────────────────
+# FastAPI app
+# ─────────────────────────────────────────────────────────────
+app = FastAPI(title="Ecommerce Voicebot (Traced)")
 
-app = FastAPI(title="Ecommerce Voicebot Day-2 (Hybrid LLM)")
+# ─────────────────────────────────────────────────────────────
+# Imports from project
+# ─────────────────────────────────────────────────────────────
+from backend.app.agents.planner import plan_track_order
+from backend.app.agents.executor import execute_task
+from backend.app.agents.evaluator import simple_evaluate
+from backend.app.agents.trace_helpers import (
+    make_langchain_tracer,
+    runnable_config_for_tracer,
+)
 
-# Globals to hold retriever & chain
+from backend.app.db import (
+    get_history,
+    save_history,
+    record_mcp_call,
+)
+
+from backend.app.database import SessionLocal
+from backend.app.mcp_server import get_order_status
+
+from backend.app.agents.langchain_prompts import build_chain
+from backend.app.rag import get_retriever
+
+from langchain_core.runnables import RunnableLambda
+
+# ─────────────────────────────────────────────────────────────
+# Global chain (lazy init)
+# ─────────────────────────────────────────────────────────────
 retriever = None
 chain = None
 
 @app.on_event("startup")
-def startup_event():
+def startup():
     global retriever, chain
-    # initialize DB (if configured)
     try:
-        init_db()
-    except Exception as e:
-        print("DB init failed:", e)
-
-    # Try to eagerly initialize retriever + chain; if it fails we lazily build later
-    try:
-        if get_retriever:
-            retriever = get_retriever()
-        if retriever and build_chain:
-            chain = build_chain(retriever)
-            print("RAG chain initialized on startup.")
-        else:
-            print("RAG chain not initialized on startup (missing retriever or build_chain).")
+        retriever = get_retriever()
+        chain = build_chain(retriever)
+        print("✅ RAG chain initialized")
     except Exception:
-        print("Warning: chain init failed on startup.")
         traceback.print_exc()
-        retriever = None
-        chain = None
+        print("⚠️ Failed to initialize RAG chain")
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "time": int(time.time())}
-
+# ─────────────────────────────────────────────────────────────
+# Request model
+# ─────────────────────────────────────────────────────────────
 class AgentRequest(BaseModel):
     transcript: str
     session_id: str
 
-def parse_action_from_text(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-    m = re.search(r"\[\[ACTION\]\](\{.*?\})\[\[/ACTION\]\]", text, re.S)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(1))
-    except Exception:
-        return None
-
-# Structured intent detection helpers
-def detect_order_id(text: str) -> Optional[str]:
-    m = re.search(r"\border\s*(?:id\s*)?[:#]?\s*(\d+)\b", text, re.I)
-    if m:
-        return m.group(1)
-    return None
-
-def detect_product_id(text: str) -> Optional[int]:
-    m = re.search(r"\bproduct\s+(?:id\s*)?[:#]?\s*(\d+)\b", text, re.I)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    return None
-
-@app.post("/agent/handle")
-async def agent_handle(req: AgentRequest):
+# ─────────────────────────────────────────────────────────────
+# CHANGE 2: Force at least one traced LangChain call per request
+# ─────────────────────────────────────────────────────────────
+def force_trace_ping(tracer, run_name: str):
     """
-    Accepts: { transcript: str, session_id: str }
-    Returns: { reply: str, sources: [{page_content, metadata}], actions: [{name,args,...}] }
+    Guarantees a LangChain invocation so LangSmith always records a run,
+    even if we exit early (order-id/product-id shortcut paths).
     """
-    global retriever, chain
+    if tracer is None:
+        return
 
-    if not req.transcript:
-        raise HTTPException(status_code=400, detail="transcript required")
-
-    # Load/save conversation history convenience
+    ping = RunnableLambda(lambda x: "trace_ping")
     try:
-        history = get_history(req.session_id) or []
-    except Exception:
-        history = []
-
-    # 1) Structured intent: ORDER (exact)
-    order_id = detect_order_id(req.transcript)
-    if order_id:
-        # Call MCP stub (immediate deterministic path)
-        try:
-            mcp_result = mcp_get_order_status(order_id)
-        except Exception as e:
-            mcp_result = {"error": str(e)}
-        reply = f"Order {order_id} status: {mcp_result.get('status', 'UNKNOWN')}. ETA: {mcp_result.get('eta')}"
-        # persist history
-        try:
-            history.append({"role":"user","text":req.transcript})
-            history.append({"role":"assistant","text":reply})
-            save_history(req.session_id, history)
-        except Exception:
-            pass
-        return {
-            "reply": reply,
-            "sources": [],
-            "actions": [{"name":"get_order_status","args":{"order_id":order_id},"result":mcp_result}]
-        }
-
-    # 2) Structured intent: PRODUCT ID (exact)
-    prod_id = detect_product_id(req.transcript)
-    if prod_id is not None:
-        try:
-            prod = get_product_by_id(prod_id)
-        except Exception:
-            prod = None
-        if prod:
-            reply = f"{prod.get('name')} (SKU: {prod.get('sku')}): {prod.get('description')}. Price: {prod.get('price')} {prod.get('currency')}."
-            try:
-                history.append({"role":"user","text":req.transcript})
-                history.append({"role":"assistant","text":reply})
-                save_history(req.session_id, history)
-            except Exception:
-                pass
-            return {
-                "reply": reply,
-                "sources": [{"page_content": str(prod), "metadata": {"table":"products","id":prod_id}}],
-                "actions": []
-            }
-        # If product not found, continue to RAG fallback
-
-    # 3) Ensure chain exists (lazy init)
-    if chain is None:
-        try:
-            if get_retriever and build_chain:
-                retriever = get_retriever()
-                chain = build_chain(retriever)
-                print("DEBUG: chain lazily initialized inside agent_handle.")
-            else:
-                print("DEBUG: get_retriever or build_chain unavailable.")
-        except Exception as e:
-            # print traceback in server logs and return a useful reply
-            traceback.print_exc()
-            reply = f"LLM init failed: {type(e).__name__}: {str(e)[:200]}"
-            # save minimal history
-            try:
-                history.append({"role":"user","text":req.transcript})
-                history.append({"role":"assistant","text":reply})
-                save_history(req.session_id, history)
-            except Exception:
-                pass
-            return {"reply": reply, "sources": [], "actions": []}
-
-    # 4) If chain still missing, respond gracefully
-    if chain is None:
-        reply = "Agent not available (LLM not initialized)."
-        try:
-            history.append({"role":"user","text":req.transcript})
-            history.append({"role":"assistant","text":reply})
-            save_history(req.session_id, history)
-        except Exception:
-            pass
-        return {"reply": reply, "sources": [], "actions": []}
-
-    # 5) Prepare chat history for ConversationalRetrievalChain API (list of (user, assistant))
-    formatted_history = []
-    user_buf = None
-    for item in history:
-        r = item.get("role"); t = item.get("text")
-        if r == "user":
-            user_buf = t
-        elif r == "assistant" and user_buf:
-            formatted_history.append((user_buf, t))
-            user_buf = None
-
-    # 6) Run the chain
-    try:
-        result = chain({"question": req.transcript, "chat_history": formatted_history})
-    except Exception as e:
-        # fallback to older chain.run() shape if necessary
-        try:
-            result_text = chain.run(req.transcript)
-            result = {"answer": result_text, "source_documents": []}
-        except Exception as e2:
-            traceback.print_exc()
-            reply = f"LLM error: {type(e2).__name__}: {str(e2)[:200]}"
-            try:
-                history.append({"role":"user","text":req.transcript})
-                history.append({"role":"assistant","text":reply})
-                save_history(req.session_id, history)
-            except Exception:
-                pass
-            return {"reply": reply, "sources": [], "actions": []}
-
-    # 7) Normalize chain result
-    reply_text = result.get("answer") or result.get("response") or result.get("output_text") or ""
-    source_docs = []
-    for d in result.get("source_documents", []):
-        try:
-            source_docs.append({"page_content": d.page_content, "metadata": getattr(d, "metadata", {})})
-        except Exception:
-            try:
-                source_docs.append(dict(d))
-            except Exception:
-                source_docs.append({"page_content": str(d)})
-
-    # 8) Parse actions embedded in LLM reply (if any) and call MCP
-    action = parse_action_from_text(reply_text)
-    actions = []
-    if action:
-        actions.append(action)
-        if action.get("name") == "get_order_status":
-            order_id_arg = action.get("args", {}).get("order_id")
-            try:
-                actions[0]["result"] = mcp_get_order_status(order_id_arg)
-            except Exception as e:
-                actions[0]["error"] = str(e)
-
-    # 9) Save updated history
-    try:
-        history.append({"role":"user","text":req.transcript})
-        history.append({"role":"assistant","text":reply_text})
-        save_history(req.session_id, history)
+        ping.invoke(
+            {"ping": True},
+            config=runnable_config_for_tracer(
+                tracer,
+                run_name=f"{run_name}_ping"
+            )
+        )
     except Exception:
         pass
 
-    return {"reply": reply_text, "sources": source_docs, "actions": actions}
+# ─────────────────────────────────────────────────────────────
+# Main agent endpoint
+# ─────────────────────────────────────────────────────────────
+@app.post("/agent/handle")
+def agent_handle(req: AgentRequest):
+    if not req.transcript:
+        raise HTTPException(status_code=400, detail="transcript required")
+
+    # ─────────────────────────────────────────────────────────
+    # CHANGE 4: Single tracer per request
+    # ─────────────────────────────────────────────────────────
+    run_id = str(uuid.uuid4())
+    run_name = f"session_{req.session_id}_{run_id[:8]}"
+
+    tracer = None
+    config = {}
+    try:
+        tracer = make_langchain_tracer(
+            project_name=os.getenv("LANGSMITH_PROJECT")
+        )
+        config = runnable_config_for_tracer(tracer, run_name=run_name)
+        print(f"🧭 LangSmith run_name = {run_name}")
+    except Exception as e:
+        print("⚠️ Tracer disabled:", e)
+
+    # Helper to safely record custom spans
+    def trace_record(name: str, payload: Dict[str, Any]):
+        if tracer is None:
+            return
+        try:
+            tracer.record(name, payload)
+        except Exception:
+            pass
+
+    # Load conversation history
+    history = get_history(req.session_id) or []
+
+    # ─────────────────────────────────────────────────────────
+    # EARLY PATH 1 — Order ID detected
+    # ─────────────────────────────────────────────────────────
+    if "order" in req.transcript.lower():
+        try:
+            order_id = req.transcript.split()[-1]
+            order = jsonable_encoder(get_order_status(order_id))
+            reply = f"Order {order_id} is currently {order.get('status')}"
+
+            force_trace_ping(tracer, run_name)
+
+            history.extend([
+                {"role": "user", "text": req.transcript},
+                {"role": "assistant", "text": reply},
+            ])
+            save_history(req.session_id, history)
+
+            return {
+                "reply": reply,
+                "sources": [],
+                "actions": [{"name": "get_order_status", "args": {"order_id": order_id}}],
+            }
+        except Exception:
+            pass  # fall through to agent flow
+
+    # ─────────────────────────────────────────────────────────
+    # PLANNER
+    # ─────────────────────────────────────────────────────────
+    plan = plan_track_order(req.transcript, req.session_id) or []
+    trace_record("planner_output", {"plan": plan})
+
+    # ─────────────────────────────────────────────────────────
+    # EXECUTOR
+    # ─────────────────────────────────────────────────────────
+    db = SessionLocal()
+    executor_results = []
+
+    for task in plan:
+        try:
+            result = execute_task(db, task, req.session_id, run_id=run_id)
+        except Exception as e:
+            result = {"task": task.get("task"), "result": {"error": str(e)}}
+
+        executor_results.append(result)
+        trace_record("executor_call", jsonable_encoder(result))
+
+    # ─────────────────────────────────────────────────────────
+    # EVALUATOR
+    # ─────────────────────────────────────────────────────────
+    evaluation = simple_evaluate(executor_results)
+    trace_record("evaluation", evaluation)
+
+    # ─────────────────────────────────────────────────────────
+    # CHANGE 3: ONLY invoke LangChain via `.invoke(..., config)`
+    # ─────────────────────────────────────────────────────────
+    if chain is None:
+        force_trace_ping(tracer, run_name)
+        return {"reply": "LLM unavailable", "sources": [], "actions": []}
+
+    formatted_history = [
+        (h1["text"], h2["text"])
+        for h1, h2 in zip(history[::2], history[1::2])
+        if h1["role"] == "user" and h2["role"] == "assistant"
+    ]
+
+    result = chain.invoke(
+        {
+            "question": req.transcript,
+            "chat_history": formatted_history,
+            "mcp_results": executor_results,
+        },
+        config=config,
+    )
+
+    reply_text = result.get("answer") or ""
+    sources = result.get("source_documents", [])
+
+    trace_record("final_reply", {"reply": reply_text})
+
+    history.extend([
+        {"role": "user", "text": req.transcript},
+        {"role": "assistant", "text": reply_text},
+    ])
+    save_history(req.session_id, history)
+
+    db.close()
+
+    return {
+        "reply": reply_text,
+        "sources": sources,
+        "actions": executor_results,
+    }

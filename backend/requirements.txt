@@ -26,3 +26,8 @@ langchain-openai>=0.1.0
 langchain-community>=0.2.0
 pydantic>=2.8.0
 sqlalchemy>=1.4
+httpx
+alembic
+langsmith        # if you're using LangSmith SDK
+autogen          # (if you use the AutoGen package) OR the autogen package of choice
+respx

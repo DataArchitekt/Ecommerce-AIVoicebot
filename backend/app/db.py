@@ -3,6 +3,9 @@ import os
 from sqlalchemy import create_engine, Column, String, Integer, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import json
+from .db_models import McpCall
+from sqlalchemy.orm import Session
+import time
 
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
 
@@ -81,3 +84,31 @@ def get_product_by_id(product_id: int):
                 cols = result.keys()
                 return {cols[i]: row[i] for i in range(len(cols))}
 
+def record_mcp_call(
+    db,
+    session_id,
+    task_name,
+    tool_name,
+    args,
+    result,
+    status,
+    duration_ms,
+    run_id=None,          
+):
+    entry = McpCall(
+        session_id=session_id,
+        task_name=task_name,
+        tool_name=tool_name,
+        args=args or {},
+        result=result or {},
+        status=status,
+        duration_ms=duration_ms,
+        run_id=run_id,
+    )
+
+    try:
+        db.add(entry)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
