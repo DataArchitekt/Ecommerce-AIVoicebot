@@ -81,6 +81,13 @@ def build_chain(retriever) -> ConversationalRetrievalChain:
         "You are an ecommerce assistant. Use retrieved documents to answer user queries. "
         "If user asks about order status, emit an action JSON in the response using markers: "
         "`[[ACTION]]{\"name\":\"get_order_status\",\"args\":{\"order_id\":\"12345\"}}[[/ACTION]]`"
+        "You may receive graph_context which contains explicit product relationships"
+        "(e.g., similar products, categories, brands)."
+        "Graph data is factual and MUST be preferred over assumptions."
+        "Use it to:"
+        "- Compare products"
+        "- Recommend alternatives"
+        "- Explain relationships"
     )
 
     prompt_template = PromptTemplate(

@@ -1,140 +1,98 @@
-# backend/app/rag.py
-"""
-RAG helper: embeddings, retriever, indexer.
-Hybrid: use OpenAI embeddings when OPENAI_API_KEY present, otherwise use local HF embeddings.
-Primary vector DB: Weaviate (cloud) if WEAVIATE_URL+KEY set, otherwise FAISS local fallback.
-"""
-
-import os
 from typing import List, Dict
-from pathlib import Path
-
-# modern LangChain community imports
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Weaviate as LangWeaviate
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-
-import weaviate as weav_client
-
-# env (support DB_PATH names in backend/.env)
-BASE = Path(__file__).resolve().parents[1]
-ENV_PATH = BASE / ".env"
-if ENV_PATH.exists():
-    # lightweight loading; does not overwrite process env if already set
-    from dotenv import load_dotenv
-    load_dotenv(ENV_PATH)
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional
-WEAVIATE_URL = os.getenv("WEAVIATE_URL")      # optional
-WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
-FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", str(BASE / "../data/faiss_index"))
-
-USE_OPENAI = bool(OPENAI_API_KEY)
-
-# --- use HF embeddings always for indexing to avoid OpenAI quota issues ---
+from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
-def get_embedding():
-    """
-    Always return a local HF embeddings instance for indexing and retrieval.
-    If OPENAI_API_KEY is present and you want to use OpenAI, change this intentionally.
-    """
-    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# -------------------------------------------------------------------
+# Embeddings (MUST match indexing)
+# -------------------------------------------------------------------
 
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
 
+# -------------------------------------------------------------------
+# Vector store (single source of truth)
+# -------------------------------------------------------------------
 
+def get_vectorstore():
+    return Chroma(
+        collection_name="ecommerce_docs",
+        persist_directory="backend/data/chroma",
+        embedding_function=get_embeddings(),  # 🔥 CRITICAL
+    )
 
+# -------------------------------------------------------------------
+# Backward compatibility (do NOT remove)
+# -------------------------------------------------------------------
 
-def _weaviate_client():
-    """Return a Weaviate client if credentials present and reachable, else None."""
-    if not WEAVIATE_URL or not WEAVIATE_API_KEY:
-        return None
-    try:
-        auth = weav_client.auth.AuthApiKey(api_key=WEAVIATE_API_KEY)
-        client = weav_client.Client(url=WEAVIATE_URL, auth_client_secret=auth)
-        # quick ping
-        client.schema.get()
-        return client
-    except Exception:
-        return None
-
-def ensure_weaviate_class(client, class_name: str = "ProductDoc"):
-    schema = {
-        "class": class_name,
-        "properties": [
-            {"name": "text", "dataType": ["text"]},
-            {"name": "meta", "dataType": ["text"]}
-        ]
-    }
-    try:
-        existing = client.schema.get()
-        classes = [c["class"] for c in existing.get("classes", [])]
-        if class_name not in classes:
-            client.schema.create_class(schema)
-    except Exception:
-        # ignore - may already exist or weaviate cloud has restrictions
-        pass
+def init_vectorstore():
+    return get_vectorstore()
 
 def get_retriever():
-    """
-    Return retriever:
-      1. Weaviate (if configured)
-      2. Chroma local fallback (persisted to CHROMA_PERSIST_DIR, default: ./vector_db)
-    """
-    emb = get_embedding()
+    return get_vectorstore().as_retriever(search_kwargs={"k": 4})
 
-    # --- OPTION 1: Weaviate Cloud ---
-    client = _weaviate_client()
-    if client:
-        ensure_weaviate_class(client, "ProductDoc")
-        vs = LangWeaviate(client, "ProductDoc", embedding=emb)
-        return vs.as_retriever(search_kwargs={"k": 4})
+# -------------------------------------------------------------------
+# FINAL SAFE RAG (no LangChain wrapper bugs)
+# -------------------------------------------------------------------
 
-    # --- OPTION 2: Local Chroma fallback (persisted) ---
-    from langchain_community.vectorstores import Chroma
-    persist_dir = os.getenv("CHROMA_PERSIST_DIR", "vector_db")
-    # create dir if missing (Chroma will populate when indexing)
-    os.makedirs(persist_dir, exist_ok=True)
+def handle_rag(query: str, session_id: str) -> Dict:
+    vectorstore = get_vectorstore()
 
-    # If Chroma already has persisted data, load it. Otherwise, create an empty but persistent store.
-    try:
-        vs = Chroma(persist_directory=persist_dir, embedding_function=emb)  # load existing
-        # some langchain versions use Chroma.from_persisted; above works with recent wrappers
-    except Exception:
-        # fallback creation
-        vs = Chroma.from_texts([""], embedding=emb, persist_directory=persist_dir)
+    # Direct Chroma query with embeddings now present
+    results = vectorstore._collection.query(
+        query_texts=[query],
+        n_results=4,
+        where={"type": {"$in": ["product", "video_transcript"]}},
+    )
 
-    return vs.as_retriever(search_kwargs={"k": 4})
+    documents = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+
+    if not documents:
+        return {
+            "reply": "I could not find relevant information.",
+            "sources": [],
+        }
+
+    return {
+        "reply": documents[0],
+        "sources": [
+            {"page_content": d, "metadata": m}
+            for d, m in zip(documents, metadatas)
+        ],
+    }
 
 
-def index_documents_to_weaviate(docs: List[Dict]):
-    """
-    Index docs. Prefer Weaviate cloud if configured. Otherwise use Chroma local fallback.
-    """
-    emb = get_embedding()
-    client = _weaviate_client()
-    documents = [Document(page_content=d["text"], metadata=d.get("meta", {})) for d in docs]
+def handle_rag(query: str, session_id: str):
+    vectorstore = get_vectorstore()
 
-    # 1) Try Weaviate if configured
-    if client:
-        ensure_weaviate_class(client, "ProductDoc")
-        vs = LangWeaviate(client, "ProductDoc", embedding=emb)
-        vs.add_documents(documents)
-        return vs
+    results = vectorstore._collection.query(
+        query_texts=[query],
+        n_results=4,
+        where={"type": {"$in": ["product", "video_transcript"]}},
+    )
 
-    # 2) Chroma local fallback (works on macOS)
-    print(">>> Using Chroma fallback for indexing")
-    from langchain_community.vectorstores import Chroma
-    persist_dir = os.getenv("CHROMA_PERSIST_DIR", "vector_db")
-    texts = [d["text"] for d in docs]
-    metadatas = [d.get("meta", {}) for d in docs]
-    vs = Chroma.from_texts(texts, embedding=emb, metadatas=metadatas, persist_directory=persist_dir)
-    return vs
+    # These two lines DEFINE the variables correctly
+    documents = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
 
-def index_sample_docs():
-    sample = [
-        {"id":"p1","text":"Order 12345 is processed and handed to courier. Typical ETA 2 days.", "meta":{"type":"order_note"}},
-        {"id":"p2","text":"Red cotton t-shirt, SKU 123, shipping 3-5 days", "meta":{"sku":"123","type":"product"}},
-    ]
-    return index_documents_to_weaviate(sample)
+    if not documents:
+        return {
+            "reply": "I could not find relevant information.",
+            "sources": [],
+        }
+
+    # ✅ Take ONLY the top document
+    top_doc = documents[0]
+    top_meta = metadatas[0]
+
+    return {
+        "reply": top_doc,
+        "sources": [
+            {
+                "page_content": top_doc,
+                "metadata": top_meta,
+            }
+        ],
+    }

@@ -1,6 +1,6 @@
 # backend/app/db.py
 import os
-from sqlalchemy import create_engine, Column, String, Integer, Text
+from sqlalchemy import JSON, create_engine, Column, String, Integer, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import json
 from .db_models import McpCall
@@ -21,6 +21,26 @@ class Conversation(Base):
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String, unique=True, index=True)
     history = Column(Text, default="[]")  # JSON string of list[{"role":"user"/"assistant","text":...}]
+
+class MCPCallLog(Base):
+    __tablename__ = "mcp_calls"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    session_id = Column(String, index=True)
+
+    task_name = Column(String, nullable=False)   # 👈 REQUIRED by DB
+    tool_name = Column(String, index=True)
+    operation = Column(String)
+
+    args = Column(JSON)
+    result = Column(JSON)
+
+    status = Column(String)
+    duration_ms = Column(Integer)
+
+    run_id = Column(String, nullable=True)
+
 
 def init_db():
     Base.metadata.create_all(bind=engine)
@@ -88,12 +108,12 @@ def record_mcp_call(db, session_id, name, tool, args, result, status, duration_m
     # ✅ Allow db to be optional (WS / demo mode)
     if db is None:
         return
-
     try:
-        entry = MCPCall(
+        entry = MCPCallLog(
             session_id=session_id,
-            name=name,
-            tool=tool,
+            task_name=name,          
+            tool_name=name,         
+            operation=tool,         
             args=args,
             result=result,
             status=status,
@@ -105,3 +125,4 @@ def record_mcp_call(db, session_id, name, tool, args, result, status, duration_m
     except Exception:
         db.rollback()
         raise
+

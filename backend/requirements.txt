@@ -1,4 +1,3 @@
-fastapi==0.100.0
 uvicorn[standard]==0.21.1
 python-multipart
 requests
@@ -19,7 +18,9 @@ chromadb>=0.4.3
 sentence-transformers>=2.2.2
 transformers>=4.30.0
 weaviate-client>=4.18.3  # optional, you can ignore if you never use weaviate
-httpx>=0.24.0
+fastapi==0.109.2
+starlette==0.36.3
+httpx==0.28.1
 pytest>=7.3.0
 langchain>=0.3.27
 langchain-openai>=0.1.0
@@ -33,3 +34,6 @@ autogen          # (if you use the AutoGen package) OR the autogen package of ch
 respx
 pyttsx3
 elevenlabs
+neo4j
+yt-dlp
+ffmpeg-python

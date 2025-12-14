@@ -16,8 +16,8 @@ from app.ws_audio_out import stream_wav_over_ws
 from app.stt_file import router as stt_router
 
 from fastapi.middleware.cors import CORSMiddleware
-
-
+from backend.app.memory import SessionMemory
+from backend.app.rag import handle_rag
 
 # ─────────────────────────────────────────────────────────────
 # ENV LOADING (must happen before tracer creation)
@@ -168,19 +168,13 @@ async def agent_ws(ws: WebSocket):
 # ─────────────────────────────────────────────────────────────
 # Global chain (lazy init)
 # ─────────────────────────────────────────────────────────────
-retriever = None
-chain = None
 
 @app.on_event("startup")
 def startup():
     global retriever, chain
-    try:
-        retriever = get_retriever()
-        chain = build_chain(retriever)
-        print("✅ RAG chain initialized")
-    except Exception:
-        traceback.print_exc()
-        print("⚠️ Failed to initialize RAG chain")
+    retriever = get_retriever()
+    chain = build_chain(retriever)
+
 
 # ─────────────────────────────────────────────────────────────
 # Request model
@@ -225,6 +219,23 @@ def agent_handle(req: AgentRequest):
     # ─────────────────────────────────────────────────────────
     run_id = str(uuid.uuid4())
     run_name = f"session_{req.session_id}_{run_id[:8]}"
+    memory = SessionMemory()
+    history = memory.get(req.session_id)
+
+    prompt_input = {
+        "question": req.transcript,
+        "chat_history": history
+    }
+
+    response = chain.invoke(prompt_input)
+
+    memory.add(req.session_id, f"User: {req.transcript}")
+    memory.add(req.session_id, f"Bot: {response.get('answer', '')}")
+    print(
+    f"[MEMORY] session={req.session_id} "
+    f"loaded_turns={len(history)}"
+    )
+
 
     tracer = None
     config = {}
@@ -245,23 +256,34 @@ def agent_handle(req: AgentRequest):
             tracer.record(name, payload)
         except Exception:
             pass
-        
-    def extract_reply_text(agent_response: dict) -> str:
-    #Converts structured agent output into a speakable string for TTS
-        if not agent_response:
-            return "Sorry, I could not process that."
-            result = agent_response.get("result", {})
-        if isinstance(result, str):
-            return result
-        if isinstance(result, dict):
-            if "reply" in result:
-                return result["reply"]
-        if "message" in result:
-            return result["message"]
-        if "error" in result:
-            return f"Sorry, {result['error']}."
-    return "I have processed your request."
 
+    def extract_reply(agent_result):
+        """ Extract a human-readable reply from agent / executor output.
+        Falls back only if NO usable reply is found."""
+
+        if not agent_result:
+            return "Sorry, I couldn't process your request."
+
+        # Case 1: Direct reply
+        if isinstance(agent_result, dict):
+            if "reply" in agent_result and agent_result["reply"]:
+                return agent_result["reply"]
+
+            # Case 2: Nested result from executor
+            result = agent_result.get("result")
+            if isinstance(result, dict) and result.get("reply"):
+                return result["reply"]
+
+            # Case 3: Tool output
+            if "output" in agent_result and agent_result["output"]:
+                return str(agent_result["output"])
+
+        # Case 4: Plain string
+        if isinstance(agent_result, str):
+            return agent_result
+
+        # LAST resort fallback
+        return "I have processed your request."
 
     # Load conversation history
     history = get_history(req.session_id) or []
@@ -302,15 +324,25 @@ def agent_handle(req: AgentRequest):
     # ─────────────────────────────────────────────────────────
     db = SessionLocal()
     executor_results = []
+            
+    actions = []
+    sources = [] 
+    final_reply = None
 
     for task in plan:
-        try:
-            result = execute_task(db, task, req.session_id, run_id=run_id)
-        except Exception as e:
-            result = {"task": task.get("task"), "result": {"error": str(e)}}
+        result = execute_task(db, task, req.session_id, run_id=run_id)
+        actions.append(result)
 
-        executor_results.append(result)
-        trace_record("executor_call", jsonable_encoder(result))
+        if isinstance(result, dict):
+            if result.get("sources"):
+                sources.extend(result["sources"])
+            if result.get("reply"):
+                final_reply = result["reply"]
+        return {
+            "reply": final_reply or "I don't know",
+            "sources": sources,
+            "actions": actions,
+        }
 
     # ─────────────────────────────────────────────────────────
     # EVALUATOR

@@ -1,26 +1,23 @@
-# scripts/index_to_weaviate.py
+from backend.app.rag import get_vectorstore
+from langchain.schema import Document
 
-# >>> top of script file (add before other imports)
-import os, sys
-# ensure repo root (parent of 'backend') is on sys.path
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
 
-# then your existing imports
-# try both import paths for resilience:
-try:
-    from app.rag import index_documents_to_weaviate
-except Exception:
-    from backend.app.rag import index_documents_to_weaviate
+def index_documents_to_weaviate(docs):
+    vectorstore = get_vectorstore()
 
-from backend.app.rag import index_documents_to_weaviate
+    documents = [
+        Document(
+            page_content=d["text"],
+            metadata={
+                "source": d.get("source", "postgres"),
+                "type": d.get("type", "product"),
+                "product_id": str(d.get("product_id")),
+                **d.get("meta", {}),
+            },
+        )
+        for d in docs
+    ]
 
-SAMPLES = [
-    {"id":"p1","text":"Order 12345 is processed and handed to courier. Typical ETA 2 days.", "meta":{"type":"order_note"}},
-    {"id":"p2","text":"Blue jeans SKU 456. Ships in 3-5 days.", "meta":{"type":"product"}}
-]
+    vectorstore.add_documents(documents)
 
-if __name__ == "__main__":
-    vs = index_documents_to_weaviate(SAMPLES)
-    print("Indexed to weaviate (or local FAISS).")
+    print(f"✅ Indexed {len(documents)} docs")
