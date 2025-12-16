@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 from backend.app.graph import get_similar_products
 from backend.app.rag import handle_rag
+from backend.app.agents.planner_router import route_to_planner
 
 # Adjust these imports/paths to fit your project
 try:
@@ -72,7 +73,6 @@ def execute_task(db: Optional[Session], task: Dict[str, Any], session_id: str, r
             return {"task": name, "status": status,"result": {"message": "ask_for_order_id"}}
         elif name == "format_reply":
             formatted_text = args.get("text", "Here is the information you requested.")
-            # do nothing heavy here; final composition happens elsewhere
             duration_ms = int((time() - start) * 1000)
             record_mcp_call(db, session_id, name, "local", args, {"message": "format_reply_noop"}, "ok", duration_ms, run_id=run_id)
             return {"task": name, "status": status,"reply": formatted_text, "result": {"message": "format_reply_noop"}}
@@ -88,15 +88,42 @@ def execute_task(db: Optional[Session], task: Dict[str, Any], session_id: str, r
             return {
                     "task": name,
                     "status": "ok",
-                    "reply": rag_result.get("reply", ""),
+                    "reply": rag_result.get("reply") or "No relevant product information found.",
                     "sources": rag_result.get("sources", []),}
+        elif name == "agent":
+            transcript = args.get("transcript", "")
+            if transcript is None:
+                raise ValueError("Agent task requires transcript")
+            # 👉 Route to planner / intent logic
+            plan = route_to_planner(transcript, session_id)
+            print("🧠 AGENT PLAN:", plan)
+            results = []
+            final_reply = None
+            sources = []
+            results = []
+
+            for subtask in plan:
+                res = execute_task(db, subtask, session_id, run_id=run_id)
+                results.append(res)
+                print("🔧 SUBTASK RESULT:", subtask["task"], res)
+                if isinstance(res, dict):
+                    if res.get("reply"):
+                        final_reply = res["reply"]
+                    if res.get("sources"):
+                        sources.extend(res["sources"])
+
+            return {
+                "reply": final_reply or "I don't know",
+                "sources": sources,
+                "actions": results
+            }
         else:
             duration_ms = int((time() - start) * 1000)
             record_mcp_call(db, session_id, name, "unknown", args, {"error": "unknown task"}, "error", duration_ms, run_id=run_id)
             return {
                 "task": name,
                 "result": {
-                "error": "unknown task",
+                "error": f"Unknown task: {name}",
                 "needs_human": True
     }
 }

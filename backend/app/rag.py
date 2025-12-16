@@ -36,56 +36,48 @@ def get_retriever():
 # FINAL SAFE RAG (no LangChain wrapper bugs)
 # -------------------------------------------------------------------
 
-def handle_rag(query: str, session_id: str) -> Dict:
-    vectorstore = get_vectorstore()
-
-    # Direct Chroma query with embeddings now present
-    results = vectorstore._collection.query(
-        query_texts=[query],
-        n_results=4,
-        where={"type": {"$in": ["product", "video_transcript"]}},
-    )
-
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-
-    if not documents:
-        return {
-            "reply": "I could not find relevant information.",
-            "sources": [],
-        }
-
-    return {
-        "reply": documents[0],
-        "sources": [
-            {"page_content": d, "metadata": m}
-            for d, m in zip(documents, metadatas)
-        ],
-    }
-
-
 def handle_rag(query: str, session_id: str):
     vectorstore = get_vectorstore()
 
-    results = vectorstore._collection.query(
-        query_texts=[query],
-        n_results=4,
-        where={"type": {"$in": ["product", "video_transcript"]}},
-    )
+    try:
+        results = vectorstore._collection.query(
+            query_texts=[query],
+            n_results=4,
+            where={"type": {"$in": ["product", "video_transcript"]}},
+        )
+    except Exception as e:
+        # Hard failure from vector DB
+        return {
+            "reply": "I'm having trouble accessing product information right now.",
+            "sources": [],
+            "result": {
+                "error": str(e),
+                "needs_human": False
+            }
+        }
 
-    # These two lines DEFINE the variables correctly
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
+    # 🔐 SAFETY GUARD 1: results can be None
+    if not results:
+        return {
+            "reply": "I could not find relevant information.",
+            "sources": [],
+            "result": {"needs_human": False}
+        }
+
+    # 🔐 SAFETY GUARD 2: values inside results can be None
+    documents = (results.get("documents") or [[]])[0]
+    metadatas = (results.get("metadatas") or [[]])[0]
 
     if not documents:
         return {
             "reply": "I could not find relevant information.",
             "sources": [],
+            "result": {"needs_human": False}
         }
 
     # ✅ Take ONLY the top document
     top_doc = documents[0]
-    top_meta = metadatas[0]
+    top_meta = (metadatas[0] if metadatas else {})
 
     return {
         "reply": top_doc,
@@ -95,4 +87,6 @@ def handle_rag(query: str, session_id: str):
                 "metadata": top_meta,
             }
         ],
+        "result": {"needs_human": False}
     }
+

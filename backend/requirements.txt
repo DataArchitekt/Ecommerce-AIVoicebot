@@ -37,3 +37,8 @@ elevenlabs
 neo4j
 yt-dlp
 ffmpeg-python
+evaluate
+datasets
+rouge-score
+peft
+accelerate

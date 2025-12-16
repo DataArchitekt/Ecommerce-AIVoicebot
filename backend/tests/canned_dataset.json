@@ -1,0 +1,107 @@
+[
+
+{
+    "id": "p1",
+    "query": "Tell me about product 1",
+    "ground_truth": "Product 1 is an ecommerce catalog item with a defined price and description available in the product database."
+},
+{
+    "id": "p2",
+    "query": "What is the price of product 2?",
+    "ground_truth": "Product 2 has a listed price stored in the product catalog and can be retrieved from the database."
+  },
+  {
+    "id": "p3",
+    "query": "Give details for product id 3",
+    "ground_truth": "Product 3 is an ecommerce product with a name, price, and description available in the catalog."
+  },
+  {
+    "id": "p4",
+    "query": "Is product 4 in stock?",
+    "ground_truth": "Product 4 exists in the catalog; stock availability information may not be explicitly provided."
+  },
+  {
+    "id": "p5",
+    "query": "What can you tell me about product 5?",
+    "ground_truth": "Product 5 is listed in the ecommerce catalog with associated metadata such as name, price, and description."
+  },
+  {
+    "id": "p6",
+    "query": "Show me details of product 6",
+    "ground_truth": "Product 6 is an ecommerce item stored in the database with descriptive information."
+  },
+  {
+    "id": "p7",
+    "query": "How much does product 7 cost?",
+    "ground_truth": "Product 7 has a price defined in the product catalog."
+  },
+  {
+    "id": "p8",
+    "query": "Explain product 8",
+    "ground_truth": "Product 8 is an ecommerce product with catalog information such as name, description, and price."
+  },
+  {
+    "id": "p9",
+    "query": "Give me an overview of product 9",
+    "ground_truth": "Product 9 is an item available in the ecommerce catalog with relevant product details."
+  },
+  {
+    "id": "p10",
+    "query": "Tell me features of product 10",
+    "ground_truth": "Product 10 is part of the ecommerce catalog and includes standard product metadata."
+  },
+
+
+  {
+    "id": "o1",
+    "query": "Where is my order ORD-1001?",
+    "ground_truth": "Order ORD-1001 exists and its current status can be retrieved using the order status service."
+  },
+  {
+    "id": "o2",
+    "query": "Check status of order ORD-1002",
+    "ground_truth": "Order ORD-1002 has a status available through the order tracking system."
+  },
+  {
+    "id": "o3",
+    "query": "Has order ORD-1003 been delivered?",
+    "ground_truth": "Order ORD-1003 has a delivery status that can be checked via the order service."
+  },
+  {
+    "id": "o4",
+    "query": "Track my order ORD-1004",
+    "ground_truth": "Order ORD-1004 can be tracked and its current state retrieved from the order database."
+  },
+  {
+    "id": "o5",
+    "query": "What is happening with order ORD-1005?",
+    "ground_truth": "Order ORD-1005 has an associated status available through order tracking."
+  },
+
+
+  {
+    "id": "a1",
+    "query": "Tell me about it",
+    "ground_truth": "The user request is ambiguous and requires clarification about the specific product or order."
+  },
+  {
+    "id": "a2",
+    "query": "What is the status?",
+    "ground_truth": "The query lacks context and requires the user to specify an order or product."
+  },
+  {
+    "id": "a3",
+    "query": "How much does it cost?",
+    "ground_truth": "The question is ambiguous and needs a specific product reference before answering."
+  },
+  {
+    "id": "a4",
+    "query": "Can you check this for me?",
+    "ground_truth": "The request is unclear and requires additional details to proceed."
+  },
+  {
+    "id": "a5",
+    "query": "Give me more information",
+    "ground_truth": "The query is underspecified and requires clarification to provide an accurate response."
+  }
+]

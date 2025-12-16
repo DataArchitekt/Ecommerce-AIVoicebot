@@ -3,9 +3,6 @@ import os
 from sqlalchemy import JSON, create_engine, Column, String, Integer, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import json
-from .db_models import McpCall
-from sqlalchemy.orm import Session
-import time
 
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
 
@@ -24,26 +21,30 @@ class Conversation(Base):
 
 class MCPCallLog(Base):
     __tablename__ = "mcp_calls"
-
     id = Column(Integer, primary_key=True, index=True)
-
     session_id = Column(String, index=True)
-
     task_name = Column(String, nullable=False)   # 👈 REQUIRED by DB
     tool_name = Column(String, index=True)
     operation = Column(String)
-
     args = Column(JSON)
     result = Column(JSON)
-
     status = Column(String)
     duration_ms = Column(Integer)
-
     run_id = Column(String, nullable=True)
 
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 
 def get_history(session_id: str):
     db = SessionLocal()
@@ -71,7 +72,6 @@ def save_history(session_id: str, history: list):
 # -------------------------------------------------------------
 # PRODUCT LOOKUP HELPERS (ADD THESE BELOW EXISTING FUNCTIONS)
 # -------------------------------------------------------------
-from sqlalchemy import text
 
 def get_product_by_id(product_id: int):
     """
@@ -106,6 +106,7 @@ def get_product_by_id(product_id: int):
 
 def record_mcp_call(db, session_id, name, tool, args, result, status, duration_ms, run_id=None):
     # ✅ Allow db to be optional (WS / demo mode)
+    print("🔥 MCP CALLED:", name, tool, status)
     if db is None:
         return
     try:

@@ -5,14 +5,12 @@ import subprocess
 
 router = APIRouter(prefix="/stt", tags=["stt"])
 
+import whisper
+
+model = whisper.load_model("base")  # load once at module level
+
 @router.post("/file")
 async def stt_file(file: UploadFile = File(...)):
-    """
-    Accepts uploaded audio file (webm/wav),
-    converts to wav if needed,
-    runs Whisper (or dummy STT),
-    returns transcript
-    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=file.filename) as tmp:
         tmp.write(await file.read())
         input_path = tmp.name
@@ -21,15 +19,38 @@ async def stt_file(file: UploadFile = File(...)):
     if not input_path.endswith(".wav"):
         wav_path = input_path + ".wav"
         subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path, wav_path],
+            [
+                "ffmpeg",
+                "-y",
+                "-i", input_path,
+                "-ar", "16000",   # 🔑 force 16 kHz (Whisper expects this)
+                "-ac", "1",       # 🔑 force mono
+                "-vn",            # 🔑 no video
+                wav_path
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True,
         )
 
-    # ---- TEMP: dummy STT (replace with Whisper call if you already have one)
-    transcript = "dummy transcript from audio"
 
+    # ✅ REAL STT
+    result = model.transcribe(
+        wav_path,
+        language="en",
+        temperature=0.0,
+        no_speech_threshold=0.2
+    )
+    
+    transcript = result["text"].strip()
+    
+    if not transcript:
+        return {
+            "text": "",
+            "audio_path": wav_path,
+            "error": "No speech detected"
+    }
+    
     return {
         "text": transcript,
         "audio_path": wav_path

@@ -1,172 +1,332 @@
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>Mic → STT → Agent → TTS</title>
+  <meta charset="UTF-8" />
+  <title>Ecommerce Voice Agent Demo</title>
   <style>
-    body { font-family: monospace; padding: 20px; }
-    #logs {
-      height: 360px;
-      border: 1px solid #ddd;
-      padding: 8px;
-      overflow: auto;
-      white-space: pre-wrap;
+    body {
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+      padding: 20px;
     }
-    button { margin-right: 8px; }
+    button {
+      padding: 10px 16px;
+      margin-right: 10px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    #logs {
+      margin-top: 20px;
+      background: #020617;
+      padding: 12px;
+      height: 320px;
+      overflow-y: auto;
+      font-size: 12px;
+      white-space: pre-wrap;
+      border-radius: 6px;
+    }
   </style>
 </head>
 
 <body>
-  <h2>Mic → STT → Agent → TTS (WebSocket)</h2>
+  <h2>🎙️ Ecommerce Voice Agent (PCM Capture)</h2>
 
   <button id="start">Start Capture</button>
   <button id="stop" disabled>Stop & Send</button>
+  <button id="sample">▶️ Play Sample Product Query</button>
+  <input id="textFallback" placeholder="Type query if mic fails" />
+  <button id="sendText">Send</button>
 
   <div id="logs"></div>
 
-<script>
-/* -----------------------------
-    Logging helper
------------------------------- */
-const logEl = document.getElementById("logs");
-const L = (s) => {
-  logEl.innerText =
-    new Date().toISOString() + " — " + s + "\n\n" + logEl.innerText;
-  console.log(s);
-};
+  <script>
+  /* =========================================================
+    BASIC SETUP
+  ========================================================= */
+  const start = document.getElementById("start");
+  const stop = document.getElementById("stop");
+  const logs = document.getElementById("logs");
 
-/* -----------------------------
-    AudioContext (CRITICAL)
------------------------------- */
-let audioCtx = null;
+  const SESSION_ID = "demo-session";
 
-function ensureAudioContext() {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    console.log("AudioContext created");
+  function L(msg) {
+    logs.innerText =
+      new Date().toISOString() + " — " + msg + "\n\n" + logs.innerText;
+    console.log(msg);
   }
 
-  console.log("AudioContext state BEFORE:", audioCtx.state);
+  console.log("INDEX SCRIPT LOADED");
 
-  if (audioCtx.state === "suspended") {
-    audioCtx.resume().then(() => {
-      console.log("AudioContext resumed");
-    });
+  /* =========================================================
+    AUDIO CONTEXT (FOR TTS PLAYBACK)
+  ========================================================= */
+  let audioCtx = null;
+
+  function ensureAudioContext() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      L("AudioContext created");
+    }
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume();
+      L("AudioContext resumed");
+    }
   }
 
-  console.log("AudioContext state AFTER:", audioCtx.state);
-}
+  /* =========================================================
+    PCM RECORDING (NO MediaRecorder)
+  ========================================================= */
+  let pcmCtx;
+  let micStream;
+  let processor;
+  let pcmChunks = [];
+  let recordStartTime = 0;
 
-/* -----------------------------
-   TTS playback via Web Audio API
------------------------------- */
-let ttsChunks = [];
-let ttsWs = null;
+  async function startPCMRecording() {
+    pcmCtx = new AudioContext({ sampleRate: 16000 });
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-async function playTTS() {
-  if (!audioCtx || ttsChunks.length === 0) return;
+    const source = pcmCtx.createMediaStreamSource(micStream);
+    processor = pcmCtx.createScriptProcessor(4096, 1, 1);
 
-  const blob = new Blob(ttsChunks, { type: "audio/wav" });
-  const arrayBuffer = await blob.arrayBuffer();
-  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
-  const source = audioCtx.createBufferSource();
-  source.buffer = audioBuffer;
-  source.connect(audioCtx.destination);
-  source.start(0);
-
-  ttsChunks = [];
-}
-
-/* -----------------------------
-    Mic capture
------------------------------- */
-let mediaRecorder = null;
-let chunks = [];
-
-document.getElementById("start").onclick = async () => {
-  try {
-    ensureAudioContext(); // 👈 unlocks browser audio
-
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    L("Got mic stream");
-
-    chunks = [];
-    mediaRecorder = new MediaRecorder(stream);
-
-    mediaRecorder.ondataavailable = (ev) => {
-      if (ev.data && ev.data.size > 0) {
-        chunks.push(ev.data);
-      }
+    processor.onaudioprocess = (e) => {
+      pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
     };
 
-    mediaRecorder.onstart = () => L("MediaRecorder started");
-    mediaRecorder.start(1000);
+    source.connect(processor);
+  // DO NOT connect processor to destination
+  // processor.connect(pcmCtx.destination);
 
-    document.getElementById("start").disabled = true;
-    document.getElementById("stop").disabled = false;
-  } catch (e) {
-    L("Error getting mic: " + e);
-  }
-};
-
-/* -----------------------------
-    Stop → upload → agent → TTS
------------------------------- */
-document.getElementById("stop").onclick = async () => {
-  if (mediaRecorder && mediaRecorder.state !== "inactive") {
-    mediaRecorder.stop();
+    L("PCM recording started");
   }
 
-  const blob = new Blob(chunks, { type: chunks[0]?.type || "audio/webm" });
-  L("Final blob size: " + blob.size);
+  async function stopPCMRecording() {
+    processor.disconnect();
+    micStream.getTracks().forEach(t => t.stop());
+    pcmCtx.close();
 
-  const fd = new FormData();
-  fd.append("file", blob, "mic_recording.webm");
+    const wavBlob = pcmToWav(pcmChunks, 16000);
+    pcmChunks = [];
 
-  L("Uploading combined blob to /stt/file ...");
+    return wavBlob;
+  }
 
-  try {
-    const resp = await fetch("http://localhost:8000/stt/file", {
-      method: "POST",
-      body: fd,
+  /* =========================================================
+    PCM → WAV CONVERSION
+  ========================================================= */
+  function pcmToWav(buffers, sampleRate) {
+    const length = buffers.reduce((s, b) => s + b.length, 0);
+    const data = new Float32Array(length);
+    let offset = 0;
+
+    buffers.forEach(b => {
+      data.set(b, offset);
+      offset += b.length;
     });
 
-    const j = await resp.json();
-    L("TRANSCRIPT: " + JSON.stringify(j));
+    const buffer = new ArrayBuffer(44 + data.length * 2);
+    const view = new DataView(buffer);
 
-    /* ---- Agent WebSocket ---- */
+    const write = (o, s) =>
+      [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)));
+
+    write(0, "RIFF");
+    view.setUint32(4, 36 + data.length * 2, true);
+    write(8, "WAVE");
+    write(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    write(36, "data");
+    view.setUint32(40, data.length * 2, true);
+
+    let idx = 44;
+    for (let i = 0; i < data.length; i++, idx += 2) {
+      view.setInt16(idx, Math.max(-1, Math.min(1, data[i])) * 0x7fff, true);
+    }
+
+    return new Blob([view], { type: "audio/wav" });
+  }
+
+  /* =========================================================
+    AGENT WEBSOCKET + TTS PLAYBACK
+  ========================================================= */
+  let ttsWs = null;
+  let ttsChunks = [];
+
+  function connectAgentWS() {
+    if (ttsWs && ttsWs.readyState === WebSocket.OPEN) return;
+
     ttsWs = new WebSocket("ws://localhost:8000/ws/agent");
     ttsWs.binaryType = "arraybuffer";
-    ttsChunks = [];
 
-    ttsWs.onopen = () => {
-      L("Agent WS opened");
-      ttsWs.send(JSON.stringify({
-        transcript: j.text || j.transcript || "",
-        session_id: "demo-session"
-      }));
-    };
+    ttsWs.onopen = () => L("Agent WS opened");
 
-    ttsWs.onmessage = (event) => {
+    ttsWs.onmessage = async (event) => {
       if (event.data instanceof ArrayBuffer) {
-        console.log("Audio chunk:", event.data.byteLength);
         ttsChunks.push(event.data);
-      } else {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "audio_end") {
-          playTTS();
-        }
+        return;
+      }
+
+      const msg = JSON.parse(event.data);
+      L("WS control: " + JSON.stringify(msg));
+
+      if (msg.type === "audio_start") {
+        ttsChunks = [];
+      }
+
+      if (msg.type === "audio_end") {
+        await playTTS();
+      }
+
+      if (msg.reply) {
+        L("AGENT REPLY: " + msg.reply);
+      }
+
+      if (msg.type === "escalation") {
+        alert("Human agent requested");
       }
     };
-
-  } catch (e) {
-    L("Upload error: " + e);
   }
 
-  document.getElementById("start").disabled = false;
-  document.getElementById("stop").disabled = true;
-};
-</script>
+  async function playTTS() {
+    if (!audioCtx) return;
+
+    if (ttsChunks.length === 0) {
+      console.warn("No TTS audio chunks received, skipping playback");
+      return;
+    }
+
+    if (audioCtx.state === "suspended") {
+      await audioCtx.resume();
+    }
+
+    const blob = new Blob(ttsChunks, { type: "audio/wav" });
+    const buffer = await blob.arrayBuffer();
+    const audioBuffer = await audioCtx.decodeAudioData(buffer);
+
+    const src = audioCtx.createBufferSource();
+    src.buffer = audioBuffer;
+    src.connect(audioCtx.destination);
+    src.start(0);
+
+    ttsChunks = [];
+  }
+
+
+  /* =========================================================
+    BUTTON HANDLERS
+  ========================================================= */
+  const sampleBtn = document.getElementById("sample");
+
+  sampleBtn.onclick = async () => {
+    try {
+      ensureAudioContext();
+      connectAgentWS();
+
+      L("Uploading sample WAV to STT ...");
+
+      const r = await fetch("sample_product1.wav");
+      const blob = await r.blob();
+
+      const fd = new FormData();
+      fd.append("file", blob, "sample.wav");
+
+      const sttResp = await fetch("http://localhost:8000/stt/file", {
+        method: "POST",
+        body: fd
+      });
+
+      const j = await sttResp.json();
+      L("TRANSCRIPT: " + JSON.stringify(j));
+
+      if (!j.text || !j.text.trim()) {
+        alert("Sample STT failed — check WAV file");
+        return;
+      }
+
+      ttsWs.send(JSON.stringify({
+        transcript: j.text,
+        session_id: "sample-demo"
+      }));
+
+    } catch (e) {
+      L("Sample error: " + e);
+    }
+  };
+  console.log("Sample button:", document.getElementById("sample"));
+
+  sendText.onclick = () => {
+    ttsWs.send(JSON.stringify({
+      transcript: textFallback.value,
+      session_id: "demo-session"
+    }));
+  };
+
+  start.onclick = async () => {
+    try {
+      ensureAudioContext();
+      connectAgentWS();
+
+      recordStartTime = Date.now();
+      await startPCMRecording();
+
+      start.disabled = true;
+      stop.disabled = false;
+    } catch (e) {
+      L("Start error: " + e);
+    }
+  };
+
+  stop.onclick = async () => {
+    const duration = Date.now() - recordStartTime;
+    if (duration < 1500) {
+      alert("Please speak for at least 2 seconds.");
+      start.disabled = false;
+      stop.disabled = true;
+      return;
+    }
+
+    try {
+      const wavBlob = await stopPCMRecording();
+      L("Uploading PCM WAV to STT ...");
+
+      const fd = new FormData();
+      fd.append("file", wavBlob, "mic.wav");
+
+      const r = await fetch("http://localhost:8000/stt/file", {
+        method: "POST",
+        body: fd
+      });
+
+      const j = await r.json();
+      L("TRANSCRIPT: " + JSON.stringify(j));
+
+      if (!j.text || !j.text.trim()) {
+        alert("No speech detected. Please retry.");
+        return;
+      }
+
+      ttsWs.send(JSON.stringify({
+        transcript: j.text,
+        session_id: SESSION_ID
+      }));
+    } catch (e) {
+      L("Stop error: " + e);
+    } finally {
+      start.disabled = false;
+      stop.disabled = true;
+    }
+  };
+  </script>
 </body>
 </html>
