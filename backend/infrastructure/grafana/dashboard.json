@@ -1,0 +1,50 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "ecommerce-observability",
+    "title": "Ecommerce Voicebot Observability",
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "5s",
+    "panels": [
+      {
+        "type": "timeseries",
+        "title": "Agent Requests",
+        "datasource": "Prometheus",
+        "targets": [
+          {
+            "expr": "agent_requests_total",
+            "refId": "A"
+          }
+        ],
+        "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 }
+      },
+      {
+        "type": "timeseries",
+        "title": "LLM Calls",
+        "datasource": "Prometheus",
+        "targets": [
+          {
+            "expr": "llm_calls_total",
+            "refId": "A"
+          }
+        ],
+        "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 }
+      },
+      {
+        "type": "timeseries",
+        "title": "Agent Latency",
+        "datasource": "Prometheus",
+        "targets": [
+          {
+            "expr": "agent_request_latency_seconds_bucket",
+            "refId": "A"
+          }
+        ],
+        "gridPos": { "x": 0, "y": 8, "w": 24, "h": 8 }
+      }
+    ]
+  },
+  "overwrite": true
+}

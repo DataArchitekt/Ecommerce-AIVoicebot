@@ -8,6 +8,9 @@ from sqlalchemy.orm import Session
 from backend.app.graph import get_similar_products
 from backend.app.rag import handle_rag
 from backend.app.agents.planner_router import route_to_planner
+from backend.app.llm_client import openai_chat
+from backend.app.config import EMBEDDING_BACKEND
+
 
 # Adjust these imports/paths to fit your project
 try:
@@ -83,13 +86,38 @@ def execute_task(db: Optional[Session], task: Dict[str, Any], session_id: str, r
                     "task": name,
                     "status": "error",
                     "reply": "Empty RAG query",
-                    "sources": [],}
+                    "sources": [],
+                }
+
+            # 1. Retrieve context (RAG)
             rag_result = handle_rag(query=query, session_id=session_id)
+            context = rag_result.get("reply") or ""
+
+            # 2. FINAL LLM CALL (THIS WAS MISSING)
+            if EMBEDDING_BACKEND == "openai":
+                completion = openai_chat([
+                    {
+                        "role": "system",
+                        "content": "You are an ecommerce assistant. Answer using the provided context."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Context:\n{context}\n\nQuestion:\n{query}"
+                    },
+                ])
+                session_id=session_id
+                reply = completion.choices[0].message.content
+            else:
+                # HF / fallback: just return retrieved text
+                reply = context or "No relevant product information found."
+
             return {
-                    "task": name,
-                    "status": "ok",
-                    "reply": rag_result.get("reply") or "No relevant product information found.",
-                    "sources": rag_result.get("sources", []),}
+                "task": name,
+                "status": "ok",
+                "reply": reply,
+                "sources": rag_result.get("sources", []),
+            }
+
         elif name == "agent":
             transcript = args.get("transcript", "")
             if transcript is None:

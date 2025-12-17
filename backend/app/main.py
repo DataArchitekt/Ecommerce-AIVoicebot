@@ -1,38 +1,35 @@
 # backend/app/main.py
-import os
-import uuid
-import re
-import wave
+# backend/app/main.py
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, WebSocketDisconnect
-from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
 from dotenv import load_dotenv
-
-from fastapi import WebSocket, Depends
-from app.tts_adapter import TTSAdapter
-from app.ws_audio_out import stream_wav_over_ws
-from app.stt_file import router as stt_router
-
-from fastapi.middleware.cors import CORSMiddleware
-from backend.app.memory import SessionMemory
-from backend.app.agents.agent_runner import run_with_evaluation
-
-from langsmith import trace
-import backend.app.db as db
-from typing import Optional, Dict, Any
-from backend.app.db import get_db
-from backend.app.agents.evaluator import evaluate_response
-
-
 
 # ─────────────────────────────────────────────────────────────
 # ENV LOADING (must happen before tracer creation)
 # ─────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parents[1]
-ENV_PATH = ROOT / ".env"
-if ENV_PATH.exists():
-    load_dotenv(ENV_PATH)
+env_path = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=env_path)
+
+import os
+import uuid
+import re
+import wave
+from fastapi import FastAPI, HTTPException, WebSocketDisconnect
+from pydantic import BaseModel
+from fastapi import WebSocket, Depends
+from backend.app.tts_adapter import TTSAdapter
+from backend.app.ws_audio_out import stream_wav_over_ws
+from backend.app.stt_file import router as stt_router
+from backend.app.metrics import REQUEST_COUNT, REQUEST_LATENCY
+from prometheus_client import make_asgi_app
+import time
+from backend.app.metrics import PII_BLOCK_COUNT
+from fastapi.middleware.cors import CORSMiddleware
+from backend.app.agents.agent_runner import run_with_evaluation
+
+import backend.app.db as db
+from typing import Optional
+from backend.app.db import get_db
+from backend.app.mcp_middleware import contains_pii
 
 # Enforce LangSmith defaults (Change 1 prerequisite)
 os.environ.setdefault("LANGSMITH_TRACING", "true")
@@ -59,23 +56,16 @@ app.add_middleware(
 # ─────────────────────────────────────────────────────────────
 # Imports from project
 # ─────────────────────────────────────────────────────────────
-from backend.app.agents.planner import plan_track_order
 from backend.app.agents.executor import execute_task
-from backend.app.agents.evaluator import evaluate
 from backend.app.agents.trace_helpers import (
     make_langchain_tracer,
     runnable_config_for_tracer,
 )
 
-from backend.app.db import (
-    get_history,
-    save_history,
-)
 
 from backend.app.database import SessionLocal
-from backend.app.mcp_server import get_order_status
 
-from backend.app.agents.langchain_prompts import build_chain
+from backend.app.agents.langchain_prompts import build_rag_executor
 from backend.app.rag import get_retriever
 from langchain_core.runnables import RunnableLambda
 
@@ -125,7 +115,6 @@ async def agent_ws(ws: WebSocket):
                 #    run_type="chain",
                 #    metadata={"session_id": session_id, "run_id": run_id, "run_name": run_name}
                 #) as parent_run:
-                
                 agent_response = run_with_evaluation(
                     execute_fn=execute_task,
                     db=db,
@@ -169,7 +158,6 @@ async def agent_ws(ws: WebSocket):
 
                 print("TTS WAV size:", os.path.getsize(wav_path))
 
-
                 # 7️⃣ Escalation flow (ONLY if triggered)
                 if agent_response.get("result", {}).get("needs_human"):
                     escalation_wav = tts.synthesize(ESCALATION_VOICE_PROMPT)
@@ -181,7 +169,13 @@ async def agent_ws(ws: WebSocket):
                         "type": "escalation",
                         "message": "Human agent requested"
                     })
-                
+                if contains_pii(transcript):
+                    PII_BLOCK_COUNT.inc()
+                    return {
+                        "reply": "I can't help with that. Connecting you to support.",
+                        "actions": ["human_escalation"],
+                        "tts_allowed": False
+                }
             except WebSocketDisconnect:
                 print("🔴 WS client disconnected")
                 break
@@ -201,9 +195,12 @@ async def agent_ws(ws: WebSocket):
 
 @app.on_event("startup")
 def startup():
-    global retriever, chain
+    global retriever, rag_executor
+
     retriever = get_retriever()
-    chain = build_chain(retriever)
+    rag_executor = build_rag_executor(retriever)
+
+    print("✅ RAG executor initialized")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -247,6 +244,9 @@ def agent_handle(req: AgentRequest, db=Depends(get_db)):
     if not req.transcript:
         raise HTTPException(status_code=400, detail="transcript required")
 
+    start = time.time()
+    REQUEST_COUNT.labels(endpoint="/agent/handle").inc()
+
     run_id = str(uuid.uuid4())
     run_name = f"session_{req.session_id}_{run_id[:8]}"
 
@@ -258,7 +258,6 @@ def agent_handle(req: AgentRequest, db=Depends(get_db)):
     except Exception:
         tracer = None
 
-    # 🔁 SINGLE source of truth
     agent_response = run_with_evaluation(
         execute_fn=execute_task,
         db=db,
@@ -268,7 +267,16 @@ def agent_handle(req: AgentRequest, db=Depends(get_db)):
         run_id=run_id
     )
 
-    db.close()
+    REQUEST_LATENCY.labels(endpoint="/agent/handle").observe(
+        time.time() - start
+    )
 
-    # 🚨 CRITICAL: return AS-IS
+    db.close()
     return agent_response
+
+# ---- Prometheus Metrics Endpoint ----
+from prometheus_client import make_asgi_app
+
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+

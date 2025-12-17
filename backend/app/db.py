@@ -4,12 +4,13 @@ from sqlalchemy import JSON, create_engine, Column, String, Integer, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import json
 
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
+DB_URL = os.getenv("DB_URL")
 
-if not DATABASE_URL:
+if not DATABASE_URL and not DB_URL:
     raise RuntimeError("DATABASE_URL or DB_URL is required for Postgres session storage")
 
-engine = create_engine(DATABASE_URL, echo=False, future=True)
+engine = create_engine(DB_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
 

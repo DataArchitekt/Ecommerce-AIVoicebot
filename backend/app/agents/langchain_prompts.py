@@ -1,82 +1,15 @@
-# agents/langchain_prompts.py
-"""
-Build the ConversationalRetrievalChain. Hybrid LLM:
- - Use OpenAI Chat if OPENAI_API_KEY present
- - Else try a local HF-based LLM via HuggingFace pipeline
- - Else use a deterministic DummyLLM for tests
-"""
-
+# backend/app/agents/langchain_prompts.py
 import os
-from typing import Any
-from langchain.chains import ConversationalRetrievalChain
+from backend.app.llm_client import openai_chat, hf_chat
+from backend.app.config import EMBEDDING_BACKEND
 from langchain.prompts import PromptTemplate
 
-# load env from backend/.env if present for local runs
-from pathlib import Path
-BASE = Path(__file__).resolve().parents[1]
-ENV_PATH = BASE / ".env"
-if ENV_PATH.exists():
-    from dotenv import load_dotenv
-    load_dotenv(ENV_PATH)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-def _build_openai_llm():
-    from langchain_openai import ChatOpenAI
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPENAI_API_KEY)
-
-def _build_local_hf_llm():
+def build_rag_executor(retriever):
     """
-    Try to build a local HF LLM using transformers + langchain_community's HuggingFacePipeline wrapper.
-    This requires transformers & torch to be installed and a model that fits your machine.
+    Returns a callable that performs:
+    retrieval → prompt assembly → FINAL LLM CALL
     """
-    try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-        from langchain_community.llms import HuggingFacePipeline
-        # choose a small model for CPU if needed; change to a larger model if you have GPU
-        model_id = os.getenv("HF_LOCAL_MODEL", "google/flan-t5-small")  # mapping: use text2text models for small CPU
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        model = AutoModelForCausalLM.from_pretrained(model_id)
-        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=128)
-        return HuggingFacePipeline(pipeline=pipe)
-    except Exception:
-        return None
-
-# Simple deterministic fallback LLM
-from langchain.llms.base import LLM
-class DummyLLM(LLM):
-    def _call(self, prompt: str, stop=None) -> str:
-        # If user asks about "order", simulate an action
-        if "order" in prompt.lower():
-            return ("I can check that for you. "
-                    "[[ACTION]]{\"name\":\"get_order_status\",\"args\":{\"order_id\":\"12345\"}}[[/ACTION]] "
-                    "Order 12345 is currently IN_TRANSIT (simulated).")
-        return "[DUMMY] I can't access OpenAI; this is a local fallback reply."
-
-    @property
-    def _identifying_params(self):
-        return {}
-
-    @property
-    def _llm_type(self):
-        return "dummy"
-
-def build_chain(retriever) -> ConversationalRetrievalChain:
-    """
-    Build and return a ConversationalRetrievalChain configured to use the retriever provided.
-    """
-    # choose LLM
-    llm = None
-    if OPENAI_API_KEY:
-        try:
-            llm = _build_openai_llm()
-        except Exception:
-            llm = None
-    if llm is None:
-        llm = _build_local_hf_llm()
-    if llm is None:
-        llm = DummyLLM()
-
     system_prompt = (
         "You are an ecommerce assistant. Use retrieved documents to answer user queries. "
         "If user asks about order status, emit an action JSON in the response using markers: "
@@ -95,6 +28,42 @@ def build_chain(retriever) -> ConversationalRetrievalChain:
         template=system_prompt + "\n\nContext:\n{retrieved_docs}\n\nConversation History:\n{chat_history}\n\nUser question: {question}\n\nProvide a concise answer."
     )
 
-    chain = ConversationalRetrievalChain.from_llm(llm=llm, retriever=retriever, return_source_documents=True)
-    # Note: We don't directly set chain.prompt_template (varies by LangChain version). This is a general pattern.
-    return chain
+    def run(transcript: str, chat_history=None):
+        # 1. Retrieve documents
+        docs = retriever.get_relevant_documents(transcript)
+
+        context = "\n".join(d.page_content for d in docs)
+
+        # 2. Build final prompt
+        final_prompt = f"""
+        {system_prompt}
+
+        Context:
+        {context}
+
+        User:
+        {transcript}
+        """
+
+        # 3. FINAL LLM CALL (EXPLICIT & TRACEABLE)
+        if EMBEDDING_BACKEND == "openai":
+            completion = openai_chat([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": final_prompt},
+            ])
+            session_id=session_id
+            reply = completion.choices[0].message.content
+
+        elif EMBEDDING_BACKEND == "hf":
+            reply = hf_chat(final_prompt)
+
+        else:
+            reply = "Dummy response"
+
+        return {
+            "answer": reply,
+            "source_documents": docs,
+        }
+
+    return run
+

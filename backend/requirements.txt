@@ -42,3 +42,6 @@ datasets
 rouge-score
 peft
 accelerate
+#helicone
+prometheus-client
+prometheus

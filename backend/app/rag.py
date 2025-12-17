@@ -1,15 +1,12 @@
 from typing import List, Dict
 from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from backend.app.llm_client import get_embeddings
 
 # -------------------------------------------------------------------
 # Embeddings (MUST match indexing)
 # -------------------------------------------------------------------
 
-def get_embeddings():
-    return HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
+embeddings = get_embeddings()
 
 # -------------------------------------------------------------------
 # Vector store (single source of truth)

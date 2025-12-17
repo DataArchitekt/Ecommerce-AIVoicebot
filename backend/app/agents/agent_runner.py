@@ -3,7 +3,7 @@ from typing import Optional
 
 from backend.app.agents.evaluator import evaluate_response
 from backend.app.agents.reflexion import reflexion_rerun
-from app.db import record_mcp_call
+from backend.app.db import record_mcp_call
 
 BLEU_THRESHOLD = 0.30
 
