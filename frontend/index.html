@@ -34,17 +34,21 @@
 </head>
 
 <body>
-  <h2>🎙️ Ecommerce Voice Agent (PCM Capture)</h2>
+  <h2>🎙️ Ecommerce Voice Agent</h2>
 
   <button id="start">Start Capture</button>
   <button id="stop" disabled>Stop & Send</button>
   <select id="audioTest">
     <option value="product_rag.wav">Product RAG</option>
     <option value="ambiguous_query.wav">Ambiguous Query</option>
-    <option value="graph_similarity.wav">Graph Similarity</option>
     <option value="low_confidence.wav">Low Confidence</option>
     <option value="memory1.wav">Memory Step 1</option>
     <option value="memory2.wav">Memory Step 2</option>
+    <option value="graph_similarity.wav">Similar Products</option>
+    <option value="faq_query.wav">FAQ Query</option>
+    <option value="policy_query.wav">Policy Query</option>
+    <option value="escalation_query.wav">Escalation</option>
+    <option value="order_query.wav">Order Query</option>
   </select>
   <button onclick="playTest()">Run Voice Test</button>
 
@@ -179,29 +183,64 @@
     ttsWs.onopen = () => L("Agent WS opened");
 
     ttsWs.onmessage = async (event) => {
+      // -----------------------------
+      // Handle TTS audio (binary)
+      // -----------------------------
       if (event.data instanceof ArrayBuffer) {
         ttsChunks.push(event.data);
         return;
       }
 
-      const msg = JSON.parse(event.data);
-      L("WS control: " + JSON.stringify(msg));
+      // -----------------------------
+      // Parse semantic JSON message
+      // -----------------------------
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return; // ignore non-JSON text frames
+      }
 
+      // -----------------------------
+      // Audio control messages
+      // -----------------------------
       if (msg.type === "audio_start") {
         ttsChunks = [];
+        return;
       }
 
       if (msg.type === "audio_end") {
         await playTTS();
+        return;
       }
 
-      if (msg.reply) {
-        L("AGENT REPLY: " + msg.reply);
+      // -----------------------------
+      // Agent semantic response
+      // -----------------------------
+      if (msg.type === "final" || msg.type === "clarification") {
+        L("AGENT: " + msg.reply);
+        return;
+      }
+
+      // -----------------------------
+      // Status / escalation
+      // -----------------------------
+      if (msg.type === "status") {
+        L("STATUS: " + msg.message);
+        return;
       }
 
       if (msg.type === "escalation") {
-        alert("Human agent requested");
+        showAgentMessage(msg.reply);
+        alert("Human agent escalation triggered");
+        return;
       }
+
+
+      // -----------------------------
+      // Ignore WS control / MCP logs
+      // -----------------------------
+      // (task, run_id, tool, etc.)
     };
   }
 

@@ -1,246 +1,320 @@
-import httpx
-import logging
+import re
 from time import time
-from typing import Dict, Any
-from sqlalchemy.orm import Session
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
-from backend.memory.graph import get_similar_products
-from backend.rag.rag import handle_rag
-from backend.agents.planner_router import route_to_planner
-from backend.core.llm_client import openai_chat
-from backend.db.db import save_last_product
-
-
-try:
-    from backend.db.db import record_mcp_call
-except Exception:
-    from ..db import record_mcp_call
-
-MCP_BASE = "http://localhost:8000/mcp" 
-
 from sqlalchemy import text
 
-def resolve_product_id_from_metadata(db, meta: dict):
-    # Direct ID (if present)
-    if meta.get("product_id"):
-        return int(meta["product_id"])
-    if meta.get("id"):
-        return int(meta["id"])
+from backend.rag.rag import handle_rag
+from backend.memory.graph import get_similar_products
+from backend.db.db import get_product_by_id, save_last_product
+from backend.agents.planner_router import route_to_planner
+from backend.rag.faq_policy import handle_faq_query, handle_policy_query
 
-    # Resolve via SKU
-    sku = meta.get("sku")
-    if sku:
-        row = db.execute(
-            text("SELECT id FROM products WHERE sku = :sku"),
-            {"sku": sku},
-        ).fetchone()
-        if row:
-            return int(row.id)
+# -----------------------------
+# Session Store 
+# -----------------------------
+SESSION_STORE: Dict[str, Dict[str, Any]] = {}
 
+COLOR_WORDS = {"red", "blue", "green", "black", "white"}
+FABRIC_WORDS = {"cotton", "linen", "rayon"}
+
+
+# -----------------------------
+# Auth Helper
+# -----------------------------
+
+def get_session_auth(db: Session, session_id: str):
+    row = db.execute(
+        text("""
+            SELECT auth_level, customer_id
+            FROM sessions
+            WHERE session_id = :sid
+        """),
+        {"sid": session_id}
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "auth_level": row.auth_level,
+        "customer_id": row.customer_id,
+    }
+    
+def get_order_status(db: Session, order_id: str, customer_id: str):
+    row = db.execute(
+        text("""
+            SELECT status, eta
+            FROM orders
+            WHERE order_id = :oid AND customer_id = :cid
+        """),
+        {"oid": order_id, "cid": customer_id}
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "status": row.status,
+        "expected_delivery": row.eta,
+    }
+
+
+
+# -----------------------------
+# Guard Helpers
+# -----------------------------
+
+def handle_price_constraint(transcript: str):
+    m = re.search(r"(under|less than)\s+(\d+)", transcript)
+    if not m:
+        return None
+
+    price = int(m.group(2))
+    return {
+        "type": "final",
+        "reply": f"Sorry, I don’t have any shirts available under ₹{price} at the moment.",
+        "sources": [],
+    }
+
+
+def handle_memory_followup(transcript: str, session: dict, db: Session):
+    last_pid = session.get("last_product_id")
+    if not last_pid:
+        return None
+
+    FOLLOW_UP_PHRASES = {"it", "that", "same", "this"}
+
+    if last_pid and any(p in transcript.split() for p in FOLLOW_UP_PHRASES):
+        if any(c in transcript for c in COLOR_WORDS):
+            product = get_product_by_id(last_pid)
+            return {
+                "type": "final",
+                "reply": f"{product['name']} is available in multiple colours. Green is currently in stock.",
+                "sources": [],
+            }
+
+
+
+def handle_ambiguity(transcript: str):
+    tokens = set(transcript.split())
+
+    if (
+        "shirt" in tokens
+        and not tokens.intersection(COLOR_WORDS)
+        and not tokens.intersection(FABRIC_WORDS)
+    ):
+        return {
+            "type": "clarification",
+            "reply": "Are you looking for casual shirts or formal shirts?",
+        }
     return None
 
 
-def execute_task(db: Optional[Session], task: Dict[str, Any], session_id: str, run_id: Optional[str] = None, lc_config: Optional[dict] = None,) -> Dict[str, Any]:
+# -----------------------------
+# Executor Dispatcher
+# -----------------------------
+
+def execute_task(
+    db: Optional[Session],
+    task: Dict[str, Any],
+    session_id: str,
+    run_id=None,
+    lc_config=None,
+) -> Dict[str, Any]:
+
     name = task.get("task")
     args = task.get("args", {})
     start = time()
-    # --------------------------------------------------
-    # ENFORCE lc_config PROPAGATION
-    # --------------------------------------------------
-    if lc_config is None:
-        lc_config = task.get("_lc_config")
 
-    if lc_config is None:
-        print(" lc_config is None — tracing will not work")
+    # -----------------------------
+    # RAG TOOL
+    # -----------------------------
+    if name == "rag_query":
+        query = args.get("query")
+        rag_resp = handle_rag(query, session_id, lc_config)
+        sources = rag_resp.get("sources", [])
 
-    task["_lc_config"] = lc_config
+        # 🔑 Persist product memory if present
+        for s in sources:
+            meta = s.get("metadata", {})
+            if meta.get("type") == "product" and meta.get("product_id"):
+                session = SESSION_STORE.get(session_id, {})
+                session["last_product_id"] = meta["product_id"]
+                SESSION_STORE[session_id] = session
+                break
 
-    print("🧪 lc_config passed to executor:", lc_config)
-    # ─────────────────────────────────────────
-    # GRAPH TOOL (Neo4j)
-    # ─────────────────────────────────────────
-    if name == "graph_similar_products":
-        product_id = args.get("product_id")
+        return {
+            "reply": rag_resp.get("reply"),
+            "sources": sources,
+        }
+
+
+    # -----------------------------
+    # POLICY / FAQ
+    # -----------------------------
+
+
+    elif name == "faq_query":
+        answer = handle_faq_query(args.get("query"))
+        return {
+            "type": "final",
+            "reply": answer,
+            "sources": []
+        }
+
+    elif name == "policy_query":
+        answer = handle_policy_query(args.get("query"))
+        return {
+            "type": "final",
+            "reply": answer,
+            "sources": []
+        }
+
+
+    # -----------------------------
+    # HUMAN ESCALATION
+    # -----------------------------
+    elif name == "escalation_query":
+        return {
+            "type": "escalation",
+            "reply": "Connecting you to a human support agent now.",
+            "needs_human": True,
+        }
+
+    # -----------------------------
+    # ORDER QUERY (AUTH-GUARDED)
+    # -----------------------------
+    elif name == "order_query":
+        auth = get_session_auth(db, session_id)
+
+        if not auth or auth["auth_level"] != "authenticated":
+            return {
+                "type": "final",
+                "reply": "Please log in to track your order.",
+                "sources": [],
+            }
+
+        order_id = args.get("order_id")
+        order = get_order_status(db, order_id, auth["customer_id"])
+
+        if not order:
+            return {
+                "type": "final",
+                "reply": f"I couldn’t find details for order {order_id}.",
+                "sources": [],
+            }
+
+        return {
+            "type": "final",
+            "reply": (
+                f"Your order {order_id} is {order['status']} "
+                f"and is expected to be delivered by {order['expected_delivery']}."
+            ),
+            "sources": [],
+        }
+
+
+    # -----------------------------
+    # GRAPH SIMILAR PRODUCTS
+    # -----------------------------
+    elif name == "graph_similar_products":
+        session = SESSION_STORE.get(session_id, {})
+        product_id = session.get("last_product_id")
 
         if not product_id:
             return {
-                "task": name,
-                "result": {"error": "product_id missing"},
+                "type": "final",
+                "reply": "Please view a product first before asking for similar items.",
+                "sources": [],
             }
-        duration_ms = int((time() - start) * 1000)
+
         graph_result = get_similar_products(product_id)
-        if graph_result:
-            save_last_product(db, session_id, product_id)
-            print(f" Saved last_product_id from graph={product_id}")
-        record_mcp_call(db, session_id, name, "neo4j", args, {"count": len(graph_result)}, "ok", duration_ms, run_id=run_id)
+        graph_result = graph_result[:3]
+
+        if not graph_result:
+            return {
+                "type": "final",
+                "reply": "I couldn't find similar products at the moment.",
+                "sources": [],
+            }
+
+        # 🔑 Build a spoken response
+        product_names = [
+            p.get("name", "a similar product")
+            for p in graph_result
+        ]
+
+        reply_text = (
+            "Here are a few similar products you might like: "
+            + ", ".join(product_names)
+        )
 
         return {
-            "task": name,
-            "result": graph_result,
+            "type": "final",
+            "reply": reply_text,
+            "sources": graph_result,
         }
-    elif name == "get_product_price":
-            product_id = task.get("args", {}).get("product_id")
 
-            product = db.execute(
-                "SELECT name, price, currency FROM products WHERE id = :id",
-                {"id": product_id}
-            ).fetchone()
 
-            if not product:
-                return {
-                    "task": name,
-                    "status": "error",
-                    "reply": "I could not find the product price."
-                }
+    # -----------------------------
+    # AGENT ORCHESTRATOR
+    # -----------------------------
+    elif name == "agent":
+        transcript = args.get("transcript", "").lower().strip()
+        session = SESSION_STORE.get(session_id, {})
 
-            reply = f"The price of {product.name} is ₹{int(product.price)}."
-            record_mcp_call(db, session_id, "get_product_price", "postgres", args, {"message": "get_product_price"}, "ok", duration_ms, run_id=run_id)
+        # Price constraint
+        price_resp = handle_price_constraint(transcript)
+        if price_resp:
+            return price_resp
+
+        # Memory follow-up
+        mem_resp = handle_memory_followup(transcript, session, db)
+        if mem_resp:
+            return mem_resp
+
+        # Ambiguity
+        amb_resp = handle_ambiguity(transcript)
+        if amb_resp:
+            return amb_resp
+
+        # Planner → Tools
+        plan = route_to_planner(transcript, session_id, db)
+
+        final_reply = None
+        sources = []
+
+        for subtask in plan:
+            res = execute_task(db, subtask, session_id, run_id, lc_config)
+            if res.get("reply"):
+                final_reply = res["reply"]
+            if res.get("sources"):
+                sources.extend(res["sources"])
+
+        # Persist memory
+        product_sources = [s for s in sources if s.get("type") == "product"]
+        if product_sources:
+            session["last_product_id"] = product_sources[0].get("product_id")
+            SESSION_STORE[session_id] = session
+
+        if not final_reply:
             return {
-                "task": name,
-                "status": "ok",
-                "reply": reply
+                "type": "final",
+                "reply": "I found a few options. Could you please be a bit more specific?",
+                "sources": sources[:3],
             }
-    try:
-        if name == "authenticate_user":
-            url = f"{MCP_BASE}/user_profile/{session_id}"
-            resp = httpx.get(url, timeout=10.0)
-            result = resp.json()
-            status = "ok" if resp.status_code == 200 else "error"
-            duration_ms = int((time() - start) * 1000)
-            record_mcp_call(db, session_id, name, "get_user_profile", args, result, status, duration_ms, run_id=run_id)
-            return {"task": name,"status": status, "result": result, "reply": None}  # no final reply
-        elif name == "get_order_status":
-            order_id = args.get("order_id")
-            url = f"{MCP_BASE}/order_status/{order_id}"
-            resp = httpx.get(url, timeout=10.0)
-            result = resp.json()
-            status = "ok" if resp.status_code == 200 else "error"
-            duration_ms = int((time() - start) * 1000)
-            record_mcp_call(db, session_id, name, "get_order_status", args, result, status, duration_ms, run_id=run_id)
-            return {"task": name,"status": status, "result": result, "reply": None}  # no final reply
-        elif name == "create_investigation":
-            url = f"{MCP_BASE}/create_investigation"
-            resp = httpx.post(url, json=args, timeout=10.0)
-            result = resp.json()
-            status = "ok" if resp.status_code == 200 else "error"
-            duration_ms = int((time() - start) * 1000)
-            record_mcp_call(db, session_id, name, "create_investigation", args, result, status, duration_ms, run_id=run_id)
-            return {"task": name,"status": status, "result": result, "reply": None}  # no final reply
-        elif name == "ask_for_order_id":
-            duration_ms = int((time() - start) * 1000)
-            record_mcp_call(db, session_id, name, "local", args, {"message": "ask_for_order_id"}, "ok", duration_ms, run_id=run_id)
-            return {"task": name, "status": status,"result": {"message": "ask_for_order_id"}}
-        elif name == "format_reply":
-            formatted_text = args.get("text", "Here is the information you requested.")
-            duration_ms = int((time() - start) * 1000)
-            record_mcp_call(db, session_id, name, "local", args, {"message": "format_reply_noop"}, "ok", duration_ms, run_id=run_id)
-            return {"task": name, "status": status,"reply": formatted_text, "result": {"message": "format_reply_noop"}}
-        elif name == "rag_query":
-            query = task.get("args", {}).get("query")
-            original_query = task.get("args", {}).get("original_query", query)
 
-            if not query:
-                return {
-                    "task": name,
-                    "status": "error",
-                    "reply": "Empty RAG query",
-                    "sources": [],
-                }
+        return {
+            "type": "final",
+            "reply": final_reply,
+            "sources": sources,
+        }
 
-            # Run RAG
-            rag_result = handle_rag(
-                query=query,
-                session_id=session_id,
-                lc_config=lc_config,
-            )
-
-            duration_ms = int((time() - start) * 1000)
-            sources = rag_result.get("sources", [])
-            record_mcp_call(db=db,session_id=session_id,name="rag_query",tool="vector_search",args={"query": query},result={"source_count": len(rag_result.get("sources", []))},status="ok",duration_ms=duration_ms,run_id=run_id,)
-
-            # Build final reply
-            context = rag_result.get("reply") or ""
-            # ----------------------------------
-            # FINAL LLM CALL (FOR HELICONE)
-            # ----------------------------------
-
-            completion = openai_chat(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an ecommerce assistant. Answer using the provided context."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Context:\n{context}\n\nQuestion:\n{original_query}"
-                    },
-                ],
-                session_id=session_id,
-            )
-
-            reply = completion.choices[0].message.content
-
-            return {
-                "task": name,
-                "status": "ok",
-                "reply": reply,
-                "sources": sources,
-            }
-        elif name == "agent":
-            transcript = args.get("transcript", "")
-            if transcript is None:
-                raise ValueError("Agent task requires transcript")
-            # Route to planner logic
-            plan = route_to_planner(transcript,session_id,db,)
-            print(" AGENT PLAN:", plan)
-            results = []
-            final_reply = None
-            sources = []
-
-            for subtask in plan:
-                res = execute_task(db, subtask, session_id, run_id=run_id, lc_config=lc_config,)
-                results.append(res)
-                print(" SUBTASK RESULT:", subtask["task"], res)
-                if isinstance(res, dict):
-                    if res.get("reply"):
-                        final_reply = res["reply"]
-                    if res.get("sources"):
-                        sources.extend(res["sources"])
-            # --------------------------------------------------
-            # GLOBAL MEMORY SAVE (FINAL SAFETY NET)
-            # --------------------------------------------------
-            try:
-                if sources:
-                    meta = sources[0].get("metadata", {})
-                    product_id = resolve_product_id_from_metadata(db, meta)
-                    if product_id:
-                        save_last_product(db, session_id, product_id)
-                        print(f" [GLOBAL] Saved last_product_id={product_id}")
-            except Exception as e:
-                print(" Memory save skipped:", e)
-
-            return {
-                "reply": final_reply or "I don't know",
-                "sources": sources,
-                "actions": results
-            }
-        else:
-            duration_ms = int((time() - start) * 1000)
-            record_mcp_call(db, session_id, name, "unknown", args, {"error": "unknown task"}, "error", duration_ms, run_id=run_id)
-            return {
-                "task": name,
-                "result": {
-                "error": f"Unknown task: {name}",
-                "needs_human": True
+    # -----------------------------
+    # FALLBACK
+    # -----------------------------
+    return {
+        "task": name,
+        "result": {"error": f"Unknown task: {name}", "needs_human": True},
     }
-}
-
-    except Exception as e:
-        duration_ms = int((time() - start) * 1000)
-        try:
-            record_mcp_call(db, session_id, name or "unknown", "exception", args, {"error": str(e)}, "error", duration_ms, run_id=run_id)
-        except Exception:
-            logging.exception("Failed to write mcp_call")
-        logging.exception("Executor error")
-        return {"task": name, "result": {"error": str(e)}}

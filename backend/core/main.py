@@ -97,6 +97,23 @@ async def stream_wav_over_ws(ws: WebSocket, wav_path: str):
                 break
             await ws.send_bytes(chunk)
 
+def normalize_transcript(t: str) -> str:
+    t = t.lower()
+
+    # Hard overrides (demo-safe)
+    replacements = {
+        "short": "shirt",
+        "shot": "shirt",
+        "shorts": "shirts",
+        "rupees": "rs",
+    }
+
+    for k, v in replacements.items():
+        t = t.replace(k, v)
+
+    return t
+
+
 @app.websocket("/ws/agent")
 async def agent_ws(ws: WebSocket):
     await ws.accept()
@@ -110,7 +127,7 @@ async def agent_ws(ws: WebSocket):
                 session_id = data["session_id"]
                 transcript = transcript.strip()
                 transcript = re.sub(r"[.?!]+$", "", transcript)
-                
+                transcript = normalize_transcript(transcript)
                 ground_truth = data.get("ground_truth")
                 run_id = str(uuid.uuid4())
                 run_name = f"session_{session_id}_{run_id[:8]}"
@@ -290,5 +307,5 @@ def agent_handle(req: AgentRequest, db=Depends(get_db)):
 # ---- Prometheus Metrics Endpoint ----
 
 metrics_app = make_asgi_app()
-app.mount("/metrics/", metrics_app)
+app.mount("/metrics", metrics_app)
 

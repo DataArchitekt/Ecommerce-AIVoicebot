@@ -2,12 +2,24 @@
 import tempfile
 from fastapi import APIRouter, UploadFile, File
 import subprocess
+from backend.observability.metrics import STT_CALL_COUNT
 
 router = APIRouter(prefix="/stt", tags=["stt"])
 
 import whisper
 
 model = whisper.load_model("base") 
+
+def transcribe_audio(wav_path: str):
+    STT_CALL_COUNT.inc()   
+
+    result = model.transcribe(
+        wav_path,
+        language="en",
+        temperature=0.0,
+        no_speech_threshold=0.2
+    )
+    return result
 
 @router.post("/file")
 async def stt_file(file: UploadFile = File(...)):
@@ -38,7 +50,7 @@ async def stt_file(file: UploadFile = File(...)):
     result = model.transcribe(
         wav_path,
         language="en",
-        temperature=0.7,
+        temperature=0.0,
         no_speech_threshold=0.2
     )
     

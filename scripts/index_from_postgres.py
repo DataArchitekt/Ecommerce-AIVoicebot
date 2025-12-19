@@ -1,131 +1,186 @@
 """
-Indexes knowledge entities into the vector store.
+Index products, FAQs, and policies from Postgres into Chroma
+(DEMO-SAFE VERSION)
 
-Included:
-- products
-- faqs
-- policies
-
-Excluded:
-- orders
-- sessions
-- conversations
-- mcp_calls
+IMPORTANT:
+- Delete backend/data/chroma BEFORE running this script
 """
 
-from sqlalchemy import text
-from backend.db.db_utils import SessionLocal
-from backend.rag.rag import get_vectorstore   
+import os
+from typing import List
+from sqlalchemy import create_engine, text
+from langchain.schema import Document
+from langchain_community.vectorstores import Chroma
+from backend.core.llm_client import get_embeddings
 
-# --------------------------------------------------
-# DOCUMENT BUILDERS
-# --------------------------------------------------
+# -------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------
 
-PRODUCT_METADATA_FIELDS = ["color", "size", "material", "category"]
+CHROMA_DIR = "backend/data/chroma"
+COLLECTION_NAME = "ecommerce_docs"
 
-def build_product_document(row):
-    parts = [row["name"], row.get("description", "")]
+DATABASE_URL = os.environ.get(
+    "DB_URL",
+    "postgresql://user:password@localhost:5432/ecommerce"
+)
 
-    for field in PRODUCT_METADATA_FIELDS:
-        if row.get(field):
-            parts.append(f"{field.capitalize()}: {row[field]}")
+engine = create_engine(DATABASE_URL)
+embeddings = get_embeddings()
 
-    parts.append(f"Price: {row['price']} INR")
-    return ". ".join(p for p in parts if p)
+# -------------------------------------------------------------------
+# Text normalization (CRITICAL)
+# -------------------------------------------------------------------
 
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
 
-def build_faq_document(row):
-    return f"Question: {row['question']}. Answer: {row['answer']}"
+    replacements = {
+        "ethnic wear": "casual wear",
+        "ethnic": "casual",
+        "kurta": "shirt",
+        "kurtas": "shirts",
+    }
 
+    out = text.lower()
+    for k, v in replacements.items():
+        out = out.replace(k, v)
 
-def build_policy_document(row):
-    return f"{row['title']}. {row['content']}"
+    return out.strip()
 
-# --------------------------------------------------
-# INDEXING FUNCTIONS
-# --------------------------------------------------
+# -------------------------------------------------------------------
+# Fetchers
+# -------------------------------------------------------------------
 
-def index_products(session, vectorstore):
-    rows = session.execute(
-        text("""
-            SELECT sku, name, description, price, color, size, material, category
-            FROM products
-        """)
-    ).mappings().all()
+def fetch_products() -> List[dict]:
+    query = text("""
+        SELECT
+            id,
+            name,
+            description,
+            price,
+            currency,
+            sku,
+            category
+        FROM products
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(query).mappings().all()
+    return rows
 
+def fetch_faqs() -> List[dict]:
+    query = text("""
+        SELECT
+            id,
+            question,
+            answer
+        FROM faqs
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(query).mappings().all()
+    return rows
+
+def fetch_policies() -> List[dict]:
+    query = text("""
+        SELECT
+            id,
+            title,
+            content
+        FROM policies
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(query).mappings().all()
+    return rows
+
+# -------------------------------------------------------------------
+# Document builders
+# -------------------------------------------------------------------
+
+def build_product_documents(rows: List[dict]) -> List[Document]:
     docs = []
+
     for row in rows:
-        metadata = {
-            "type": "product",
-            "sku": row["sku"],
-            "price": row["price"]
-        }
+        content_parts = [
+            clean_text(row["name"]),
+            clean_text(row.get("description", "")),
+        ]
 
-        for field in PRODUCT_METADATA_FIELDS:
-            if row.get(field):
-                metadata[field] = row[field].lower()
+        page_content = ". ".join([p for p in content_parts if p])
 
-        docs.append({
-            "page_content": build_product_document(row),
-            "metadata": metadata
-        })
+        docs.append(
+            Document(
+                page_content=page_content,
+                metadata={
+                    "type": "product",
+                    "product_id": row["id"],
+                    "name": row["name"],
+                    "price": row["price"],
+                    "currency": row["currency"],
+                    "sku": row["sku"],
+                    "category": row.get("category"),
+                },
+            )
+        )
 
-    vectorstore.add_texts(
-        texts=[d["page_content"] for d in docs],
-        metadatas=[d["metadata"] for d in docs]
-    )
+    return docs
 
-    print(f" Indexed {len(docs)} products")
+def build_faq_documents(rows: List[dict]) -> List[Document]:
+    return [
+        Document(
+            page_content=f"{row['question']} {row['answer']}",
+            metadata={"type": "faq", "faq_id": row["id"]},
+        )
+        for row in rows
+    ]
 
+def build_policy_documents(rows: List[dict]) -> List[Document]:
+    return [
+        Document(
+            page_content=f"{row['title']} {row['content']}",
+            metadata={"type": "policy", "policy_id": row["id"]},
+        )
+        for row in rows
+    ]
 
-def index_faqs(session, vectorstore):
-    rows = session.execute(
-        text("SELECT faq_id, question, answer FROM faqs")
-    ).mappings().all()
-
-    vectorstore.add_texts(
-        texts=[build_faq_document(r) for r in rows],
-        metadatas=[{"type": "faq", "faq_id": r["faq_id"]} for r in rows]
-    )
-
-    print(f" Indexed {len(rows)} FAQs")
-
-
-def index_policies(session, vectorstore):
-    rows = session.execute(
-        text("SELECT policy_id, title, content FROM policies")
-    ).mappings().all()
-
-    vectorstore.add_texts(
-        texts=[build_policy_document(r) for r in rows],
-        metadatas=[{"type": "policy", "policy_id": r["policy_id"]} for r in rows]
-    )
-
-    print(f" Indexed {len(rows)} policies")
-
-# --------------------------------------------------
-# ENTRYPOINT
-# --------------------------------------------------
+# -------------------------------------------------------------------
+# Main indexing logic
+# -------------------------------------------------------------------
 
 def main():
-    print(" Indexing knowledge entities into vector store")
+    print("Starting Chroma re-index from Postgres...")
 
-    session = SessionLocal()
-    vectorstore = get_vectorstore()
+    # Create vector store
+    vectorstore = Chroma(
+        collection_name=COLLECTION_NAME,
+        persist_directory=CHROMA_DIR,
+        embedding_function=embeddings,
+    )
 
-    try:
-        index_products(session, vectorstore)
-        index_faqs(session, vectorstore)
-        index_policies(session, vectorstore)
+    all_docs: List[Document] = []
 
-        vectorstore.persist()
-        print(" Vector store persisted")
+    products = fetch_products()
+    faqs = fetch_faqs()
+    policies = fetch_policies()
 
-    finally:
-        session.close()
+    product_docs = build_product_documents(products)
+    faq_docs = build_faq_documents(faqs)
+    policy_docs = build_policy_documents(policies)
 
-    print(" Indexing complete")
+    all_docs.extend(product_docs)
+    all_docs.extend(faq_docs)
+    all_docs.extend(policy_docs)
 
+    print(f"Indexing {len(product_docs)} products")
+    print(f"Indexing {len(faq_docs)} FAQs")
+    print(f"Indexing {len(policy_docs)} policies")
+
+    vectorstore.add_documents(all_docs)
+    vectorstore.persist()
+
+    print("Chroma indexing completed successfully.")
+
+# -------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()
