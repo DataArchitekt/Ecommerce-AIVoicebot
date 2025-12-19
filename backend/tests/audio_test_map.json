@@ -1,0 +1,12 @@
+{
+    "product_rag.wav": "Show red cotton shirt size M",
+    "ambiguous_query.wav": "I want a shirt",
+    "graph_similarity.wav": "Show similar products",
+    "low_confidence.wav": "Shirt under five hundred rupees",
+    "memory1.wav": "Show me blue shirt",
+    "memory2.wav": "What is the price?",
+    "faq_query.wav": "How long does delivery take",
+    "policy_query.wav": "What is your return policy",
+    "order_query.wav": "Where is my order ORD one zero zero two",
+    "escalation_query.wav": "I want to talk to a human agent"
+}

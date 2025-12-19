@@ -5,19 +5,18 @@ sqlalchemy==1.4.54
 databases==0.6.1
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
-openai-whisper # if using openai/whisper repo via pip; see notes below
-torch     # required by whisper (or you can use openai/whisperx or faster alternatives)
+openai-whisper 
+torch     
 pydub
 PyJWT
 ffmpeg
 gTTS
 aiofiles
 openai>=0.27.0
-#faiss-cpu>=1.7.4
 chromadb>=0.4.3
 sentence-transformers>=2.2.2
 transformers>=4.30.0
-weaviate-client>=4.18.3  # optional, you can ignore if you never use weaviate
+weaviate-client>=4.18.3  
 fastapi==0.109.2
 starlette==0.36.3
 httpx==0.28.1
@@ -29,8 +28,8 @@ pydantic>=2.8.0
 sqlalchemy>=1.4
 httpx
 alembic
-langsmith        # if you're using LangSmith SDK
-autogen          # (if you use the AutoGen package) OR the autogen package of choice
+langsmith        
+autogen          
 respx
 pyttsx3
 elevenlabs
@@ -42,6 +41,4 @@ datasets
 rouge-score
 peft
 accelerate
-#helicone
 prometheus-client
-prometheus

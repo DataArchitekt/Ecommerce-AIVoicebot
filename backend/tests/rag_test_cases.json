@@ -1,0 +1,37 @@
+[
+  {
+    "id": "RAG-PRODUCT-01",
+    "type": "product",
+    "input": "Show red cotton shirt size M",
+    "expected": "Red Cotton Shirt",
+    "table": "products"
+  },
+  {
+    "id": "RAG-FAQ-01",
+    "type": "faq",
+    "input": "How long does delivery take?",
+    "expected": "3 to 5 business days",
+    "table": "faqs"
+  },
+  {
+    "id": "RAG-POLICY-01",
+    "type": "policy",
+    "input": "What is your return policy?",
+    "expected": "7 days",
+    "table": "policies"
+  },
+  {
+    "id": "TOOL-ORDER-01",
+    "type": "order",
+    "input": "Where is my order ORD-1002?",
+    "expected": "IN_TRANSIT",
+    "table": "orders"
+  },
+  {
+    "id": "EDGE-ESCALATION-01",
+    "type": "edge",
+    "input": "I want to talk to a human",
+    "expected": "escalation",
+    "table": "none"
+  }
+]

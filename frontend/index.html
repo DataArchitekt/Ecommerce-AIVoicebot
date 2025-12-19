@@ -38,7 +38,16 @@
 
   <button id="start">Start Capture</button>
   <button id="stop" disabled>Stop & Send</button>
-  <button id="sample">▶️ Play Sample Product Query</button>
+  <select id="audioTest">
+    <option value="product_rag.wav">Product RAG</option>
+    <option value="ambiguous_query.wav">Ambiguous Query</option>
+    <option value="graph_similarity.wav">Graph Similarity</option>
+    <option value="low_confidence.wav">Low Confidence</option>
+    <option value="memory1.wav">Memory Step 1</option>
+    <option value="memory2.wav">Memory Step 2</option>
+  </select>
+  <button onclick="playTest()">Run Voice Test</button>
+
   <input id="textFallback" placeholder="Type query if mic fails" />
   <button id="sendText">Send</button>
 
@@ -99,8 +108,6 @@
     };
 
     source.connect(processor);
-  // DO NOT connect processor to destination
-  // processor.connect(pcmCtx.destination);
 
     L("PCM recording started");
   }
@@ -264,6 +271,52 @@
     }
   };
   console.log("Sample button:", document.getElementById("sample"));
+
+  async function playTest() {
+    try {
+      ensureAudioContext();
+      connectAgentWS();
+
+      const file = document.getElementById("audioTest").value;
+      L("Running audio test: " + file);
+
+      // Fetch pre-generated WAV from backend
+      const r = await fetch(`http://localhost:8000/test-audio/${file}`);
+      if (!r.ok) {
+        throw new Error("Failed to load test audio: " + file);
+      }
+
+      const wavBlob = await r.blob();
+
+      // Send WAV to STT
+      const fd = new FormData();
+      fd.append("file", wavBlob, file);
+
+      L("Uploading test WAV to STT ...");
+
+      const sttResp = await fetch("http://localhost:8000/stt/file", {
+        method: "POST",
+        body: fd
+      });
+
+      const j = await sttResp.json();
+      L("TRANSCRIPT: " + JSON.stringify(j));
+
+      if (!j.text || !j.text.trim()) {
+        alert("STT failed for test audio");
+        return;
+      }
+
+      // Send transcript to agent via WS
+      ttsWs.send(JSON.stringify({
+        transcript: j.text,
+        session_id: SESSION_ID
+      }));
+
+    } catch (e) {
+      L("Voice test error: " + e.message);
+    }
+  }
 
   sendText.onclick = () => {
     ttsWs.send(JSON.stringify({
